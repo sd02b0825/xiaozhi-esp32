@@ -270,6 +270,11 @@ void AudioService::AudioInputTask() {
             int samples = 160; // 10ms
             std::vector<int16_t> data;
             if (ReadAudioData(data, 16000, samples)) {
+                // Notify audio input callback for background monitoring (e.g., environment sound upload)
+                if (callbacks_.on_audio_input) {
+                    callbacks_.on_audio_input(data);
+                }
+
                 if (bits & AS_EVENT_WAKE_WORD_RUNNING) {
                     wake_word_->Feed(data);
                 }

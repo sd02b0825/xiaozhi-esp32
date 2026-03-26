@@ -80,6 +80,15 @@ struct AudioServiceCallbacks {
     std::function<void(const std::string&)> on_wake_word_detected;
     std::function<void(bool)> on_vad_change;
     std::function<void(void)> on_audio_testing_queue_full;
+    /**
+     * @brief Callback for raw audio input data
+     * @param pcm_data Raw PCM audio data (16-bit, 16kHz mono)
+     * 
+     * This callback is invoked for every audio frame read from the microphone,
+     * regardless of wake word or voice processing state. It can be used for
+     * background audio monitoring (e.g., environment sound upload).
+     */
+    std::function<void(const std::vector<int16_t>&)> on_audio_input;
 };
 
 
