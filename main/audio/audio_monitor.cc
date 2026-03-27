@@ -143,7 +143,8 @@ size_t AudioRingBuffer::Size() const {
 //==============================================================================
 
 AudioMonitor::AudioMonitor()
-    : ring_buffer_(std::make_unique<AudioRingBuffer>(BUFFER_CAPACITY_SAMPLES)) {
+    : ring_buffer_(std::make_unique<AudioRingBuffer>(BUFFER_CAPACITY_SAMPLES)),
+      client_id_(SystemInfo::GetMacAddress()) {
     last_upload_time_ = std::chrono::steady_clock::now();
     event_group_ = xEventGroupCreate();
 }

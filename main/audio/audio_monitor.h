@@ -167,7 +167,6 @@ private:
 
     // Default configuration
     static constexpr const char* DEFAULT_UPLOAD_URL = "https://ed7c5a2ce79946108b57afb32224df19--8091.ap-shanghai2.cloudstudio.club/upload/audio";
-    static constexpr const char* DEFAULT_CLIENT_ID = "xiaozhi-esp32";
 
     // State
     std::atomic<bool> running_{false};
@@ -185,7 +184,7 @@ private:
 
     // Configuration
     std::string upload_url_{DEFAULT_UPLOAD_URL};
-    std::string client_id_{DEFAULT_CLIENT_ID};
+    std::string client_id_;
 
     // Statistics (atomic for thread-safe access from multiple threads)
     std::atomic<uint32_t> upload_count_{0};
