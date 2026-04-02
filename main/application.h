@@ -14,7 +14,9 @@
 #include "protocol.h"
 #include "ota.h"
 #include "audio_service.h"
+#if CONFIG_ENABLE_ENVIRONMENT_SOUND_DETECTION
 #include "audio_monitor.h"
+#endif
 #include "device_state.h"
 #include "device_state_machine.h"
 
@@ -135,7 +137,9 @@ private:
     AecMode aec_mode_ = kAecOff;
     std::string last_error_message_;
     AudioService audio_service_;
+#if CONFIG_ENABLE_ENVIRONMENT_SOUND_DETECTION
     AudioMonitor audio_monitor_;
+#endif
     std::unique_ptr<Ota> ota_;
 
     bool has_server_time_ = false;

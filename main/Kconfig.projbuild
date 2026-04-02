@@ -739,6 +739,15 @@ config WAKE_WORD_DETECTION_IN_LISTENING
         which allows interrupting the current conversation.
         When disabled (default), wake word detection is turned off during listening.
 
+config WAKE_WORD_DURING_SPEAKING
+    bool "Enable Wake Word Detection During TTS Playback"
+    default n
+    depends on WAKE_WORD_DETECTION_IN_LISTENING
+    help
+        Enable wake word detection while the device is speaking (TTS playback).
+        When enabled, the device can still detect wake words during audio output,
+        allowing for immediate interruption of current speech.
+
 config USE_AUDIO_PROCESSOR
     bool "Enable Audio Noise Reduction"
     default y
@@ -771,6 +780,15 @@ config USE_AUDIO_DEBUGGER
     default n
     help
         Enable audio debugger, send audio data through UDP to the host machine
+
+config ENABLE_ENVIRONMENT_SOUND_DETECTION
+    bool "Enable Environment Sound Detection"
+    default n
+    help
+        Enable environment sound detection in idle state.
+        When enabled, the device will continuously capture audio in idle state
+        and upload environment sound to a remote server periodically.
+        This can be used for background audio monitoring applications.
 
 menu "WiFi Configuration Method"
     help

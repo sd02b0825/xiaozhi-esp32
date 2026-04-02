@@ -143,6 +143,10 @@ void CustomWakeWord::Stop() {
     input_buffer_.clear();
 }
 
+bool CustomWakeWord::IsRunning() const {
+    return running_;
+}
+
 void CustomWakeWord::Feed(const std::vector<int16_t>& data) {
     if (multinet_model_data_ == nullptr) {
         return;

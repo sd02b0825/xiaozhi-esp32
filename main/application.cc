@@ -84,7 +84,12 @@ void Application::Initialize() {
         xEventGroupSetBits(event_group_, MAIN_EVENT_VAD_CHANGE);
     };
     callbacks.on_audio_input = [this](const std::vector<int16_t>& pcm) {
+#if CONFIG_ENABLE_ENVIRONMENT_SOUND_DETECTION
         audio_monitor_.Feed(pcm);
+#else
+        // Suppress unused parameter warning
+        (void)pcm;
+#endif
     };
     audio_service_.SetCallbacks(callbacks);
 
@@ -496,11 +501,21 @@ void Application::InitializeProtocol() {
 
     if (ota_->HasMqttConfig()) {
         protocol_ = std::make_unique<MqttProtocol>();
+#if CONFIG_ENABLE_ENVIRONMENT_SOUND_DETECTION
+        // Set client_id for audio monitor from MQTT settings
+        Settings settings("mqtt", false);
+        audio_monitor_.SetClientId(settings.GetString("client_id"));
+#endif
     } else if (ota_->HasWebsocketConfig()) {
         protocol_ = std::make_unique<WebsocketProtocol>();
     } else {
         ESP_LOGW(TAG, "No protocol specified in the OTA config, using MQTT");
         protocol_ = std::make_unique<MqttProtocol>();
+#if CONFIG_ENABLE_ENVIRONMENT_SOUND_DETECTION
+        // Set client_id for audio monitor from MQTT settings
+        Settings settings("mqtt", false);
+        audio_monitor_.SetClientId(settings.GetString("client_id"));
+#endif
     }
 
     protocol_->OnConnected([this]() {
@@ -908,15 +923,19 @@ void Application::HandleStateChangedEvent() {
             display->SetEmotion("neutral"); // Then set emotion (wechat mode checks child count)
             audio_service_.EnableVoiceProcessing(false);
             audio_service_.EnableWakeWordDetection(true);
+#if CONFIG_ENABLE_ENVIRONMENT_SOUND_DETECTION
             // Start background audio monitoring for environment sound upload
             audio_monitor_.Start();
+#endif
             break;
         case kDeviceStateConnecting:
             display->SetStatus(Lang::Strings::CONNECTING);
             display->SetEmotion("neutral");
             display->SetChatMessage("system", "");
+#if CONFIG_ENABLE_ENVIRONMENT_SOUND_DETECTION
             // Stop background audio monitoring when leaving idle state
             audio_monitor_.Stop();
+#endif
             break;
         case kDeviceStateListening:
             display->SetStatus(Lang::Strings::LISTENING);
@@ -948,20 +967,30 @@ void Application::HandleStateChangedEvent() {
                 play_popup_on_listening_ = false;
                 audio_service_.PlaySound(Lang::Sounds::OGG_POPUP);
             }
+#if CONFIG_ENABLE_ENVIRONMENT_SOUND_DETECTION
             // Stop background audio monitoring when entering listening mode
             audio_monitor_.Stop();
+#endif
             break;
         case kDeviceStateSpeaking:
             display->SetStatus(Lang::Strings::SPEAKING);
 
             if (listening_mode_ != kListeningModeRealtime) {
                 audio_service_.EnableVoiceProcessing(false);
+#ifdef CONFIG_WAKE_WORD_DURING_SPEAKING
+                // Enable wake word detection during TTS playback
+                // Wake word detection is handled by AudioInputTask using microphone input
+                audio_service_.EnableWakeWordDetection(true);
+#else
                 // Only AFE wake word can be detected in speaking mode
                 audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
+#endif
             }
             audio_service_.ResetDecoder();
+#if CONFIG_ENABLE_ENVIRONMENT_SOUND_DETECTION
             // Stop background audio monitoring when entering speaking mode
             audio_monitor_.Stop();
+#endif
             break;
         case kDeviceStateWifiConfiguring:
             audio_service_.EnableVoiceProcessing(false);

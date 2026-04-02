@@ -24,6 +24,7 @@ public:
     void OnWakeWordDetected(std::function<void(const std::string& wake_word)> callback);
     void Start();
     void Stop();
+    bool IsRunning() const;
     size_t GetFeedSize();
     void EncodeWakeWordData();
     bool GetWakeWordOpus(std::vector<uint8_t>& opus);

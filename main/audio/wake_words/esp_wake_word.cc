@@ -108,3 +108,7 @@ void EspWakeWord::EncodeWakeWordData() {
 bool EspWakeWord::GetWakeWordOpus(std::vector<uint8_t>& opus) {
     return false;
 }
+
+bool EspWakeWord::IsRunning() const {
+    return running_;
+}
