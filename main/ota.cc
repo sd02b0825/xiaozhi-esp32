@@ -240,6 +240,19 @@ esp_err_t Ota::CheckVersion() {
         ESP_LOGW(TAG, "No firmware section found!");
     }
 
+
+    cJSON *audio = cJSON_GetObjectItem(root, "audioMonitor");
+    if (cJSON_IsObject(audio)) {
+         cJSON *url = cJSON_GetObjectItem(audio, "url");
+        if (cJSON_IsString(url)) {
+            audio_monitor_url_ = url->valuestring;
+            ESP_LOGI(TAG, "Audio monitor URL: %s", audio_monitor_url_.c_str());
+        }
+    } else {
+        ESP_LOGI(TAG, "No audiomonitor section found!");
+    }
+
+
     cJSON_Delete(root);
     return ESP_OK;
 }

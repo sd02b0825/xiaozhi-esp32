@@ -126,6 +126,11 @@ public:
     void SetUploadUrl(const std::string& url) { upload_url_ = url; }
 
     /**
+     * Get upload URL
+     */
+    const std::string& GetUploadUrl() const { return upload_url_; }
+
+    /**
      * Set client ID (for configuration flexibility)
      */
     void SetClientId(const std::string& client_id) { client_id_ = client_id; }
@@ -165,9 +170,6 @@ private:
     static constexpr int UPLOAD_TASK_PRIORITY = 5;
     static constexpr int HTTP_TIMEOUT_MS = 10000;  // 10 seconds HTTP timeout
 
-    // Default configuration
-    static constexpr const char* DEFAULT_UPLOAD_URL = "https://ed7c5a2ce79946108b57afb32224df19--8091.ap-shanghai2.cloudstudio.club/upload/audio";
-
     // State
     std::atomic<bool> running_{false};
     TaskHandle_t upload_task_handle_ = nullptr;
@@ -183,7 +185,7 @@ private:
     std::chrono::steady_clock::time_point last_upload_time_;
 
     // Configuration
-    std::string upload_url_{DEFAULT_UPLOAD_URL};
+    std::string upload_url_;
     std::string client_id_;
 
     // Statistics (atomic for thread-safe access from multiple threads)

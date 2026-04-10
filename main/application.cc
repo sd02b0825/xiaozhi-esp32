@@ -505,6 +505,9 @@ void Application::InitializeProtocol() {
         // Set client_id for audio monitor from MQTT settings
         Settings settings("mqtt", false);
         audio_monitor_.SetClientId(settings.GetString("client_id"));
+        if (ota_) {  // 添加空指针检查
+            audio_monitor_.SetUploadUrl(ota_->GetAudioMonitorUrl());
+        }
 #endif
     } else if (ota_->HasWebsocketConfig()) {
         protocol_ = std::make_unique<WebsocketProtocol>();
@@ -515,6 +518,9 @@ void Application::InitializeProtocol() {
         // Set client_id for audio monitor from MQTT settings
         Settings settings("mqtt", false);
         audio_monitor_.SetClientId(settings.GetString("client_id"));
+        if (ota_) {  // 添加空指针检查
+            audio_monitor_.SetUploadUrl(ota_->GetAudioMonitorUrl());
+        }
 #endif
     }
 
@@ -925,7 +931,7 @@ void Application::HandleStateChangedEvent() {
             audio_service_.EnableWakeWordDetection(true);
 #if CONFIG_ENABLE_ENVIRONMENT_SOUND_DETECTION
             // Start background audio monitoring for environment sound upload
-            audio_monitor_.Start();
+                            audio_monitor_.Start();
 #endif
             break;
         case kDeviceStateConnecting:

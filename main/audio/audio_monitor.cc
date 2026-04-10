@@ -164,7 +164,17 @@ void AudioMonitor::Start() {
         ESP_LOGW(TAG, "Audio monitor already running");
         return;
     }
-
+    if(upload_url_.empty() ) {
+        ESP_LOGE(TAG, "Audio monitor URL is empty");
+        return;
+    }
+    if (upload_url_.length() < 9 || 
+        (upload_url_.find("http://") != 0 && upload_url_.find("https://") != 0)) {
+        ESP_LOGE(TAG, "Audio monitor URL format is invalid: %s (must start with http:// or https://)", 
+                 upload_url_.c_str());
+        return;
+    }
+    
     running_ = true;
     upload_count_ = 0;
     upload_error_count_ = 0;

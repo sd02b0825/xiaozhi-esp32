@@ -29,6 +29,7 @@ public:
     const std::string& GetFirmwareUrl() const { return firmware_url_; }
     const std::string& GetActivationMessage() const { return activation_message_; }
     const std::string& GetActivationCode() const { return activation_code_; }
+    const std::string& GetAudioMonitorUrl() const { return audio_monitor_url_; }
     std::string GetCheckVersionUrl();
 
 private:
@@ -47,6 +48,7 @@ private:
     std::string activation_challenge_;
     std::string serial_number_;
     int activation_timeout_ms_ = 30000;
+    std::string audio_monitor_url_;
 
     std::function<void(int progress, size_t speed)> upgrade_callback_;
     std::vector<int> ParseVersion(const std::string& version);
