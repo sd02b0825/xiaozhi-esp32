@@ -145,7 +145,6 @@ size_t AudioRingBuffer::Size() const {
 AudioMonitor::AudioMonitor()
     : ring_buffer_(std::make_unique<AudioRingBuffer>(BUFFER_CAPACITY_SAMPLES)),
       client_id_(SystemInfo::GetMacAddress()) {
-    last_upload_time_ = std::chrono::steady_clock::now();
     event_group_ = xEventGroupCreate();
 }
 
@@ -181,7 +180,6 @@ void AudioMonitor::Start() {
 
     // Clear buffer before starting
     ring_buffer_->Clear();
-    last_upload_time_ = std::chrono::steady_clock::now();
 
     // Create background upload task
     BaseType_t result = xTaskCreate(
@@ -269,29 +267,30 @@ void AudioMonitor::UploadTask() {
             break;
         }
 
-        auto now = std::chrono::steady_clock::now();
-        auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-            now - last_upload_time_).count();
-
-        if (elapsed_ms < UPLOAD_INTERVAL_MS) {
+        // Trigger upload when buffer has enough data (>= UPLOAD_CHUNK_SAMPLES)
+        // This avoids fixed-interval timing issues where HTTP latency causes data
+        // accumulation and loss. Data-driven triggering ensures we upload as soon
+        // as 3 seconds of audio is available, regardless of upload duration.
+        size_t buffered_samples = ring_buffer_->Size();
+        if (buffered_samples < UPLOAD_CHUNK_SAMPLES) {
             continue;
         }
 
-        // Collect audio data to upload
+        // Collect audio data to upload (limit to UPLOAD_CHUNK_SAMPLES per upload)
         std::vector<int16_t> data_to_upload;
-        size_t samples = ring_buffer_->ReadAvailable(data_to_upload);
+        size_t samples = ring_buffer_->ReadAvailable(data_to_upload, UPLOAD_CHUNK_SAMPLES);
 
         if (samples == 0) {
-            last_upload_time_ = now;  // Reset timer even if no data
             continue;
         }
+
+        ESP_LOGD(TAG, "Uploading %u samples (%.1f seconds)",
+                 static_cast<unsigned int>(samples), samples / 16000.0f);
 
         // Perform upload (this may take time but doesn't block audio feeding)
         // Check running_ before and after to enable early exit
         if (!running_) break;
         UploadAudio(data_to_upload);
-
-        last_upload_time_ = std::chrono::steady_clock::now();
     }
 
     ESP_LOGI(TAG, "Upload task exiting gracefully");

@@ -742,7 +742,6 @@ config WAKE_WORD_DETECTION_IN_LISTENING
 config WAKE_WORD_DURING_SPEAKING
     bool "Enable Wake Word Detection During TTS Playback"
     default n
-    depends on WAKE_WORD_DETECTION_IN_LISTENING
     help
         Enable wake word detection while the device is speaking (TTS playback).
         When enabled, the device can still detect wake words during audio output,

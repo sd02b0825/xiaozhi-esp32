@@ -839,7 +839,10 @@ void Application::HandleWakeWordDetectedEvent() {
         // Channel already opened, continue directly
         ContinueWakeWordInvoke(wake_word);
     } else if (state == kDeviceStateSpeaking || state == kDeviceStateListening) {
-        AbortSpeaking(kAbortReasonWakeWordDetected);
+        if (state == kDeviceStateSpeaking){
+            AbortSpeaking(kAbortReasonWakeWordDetected);
+        }
+        
         // Clear send queue to avoid sending residues to server
         while (audio_service_.PopPacketFromSendQueue());
 

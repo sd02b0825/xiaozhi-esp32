@@ -14,7 +14,6 @@
 #include <mutex>
 #include <atomic>
 #include <vector>
-#include <chrono>
 #include <functional>
 #include <memory>
 
@@ -162,10 +161,11 @@ private:
     std::string BuildJsonPayload(const std::string& base64_data);
 
     // Configuration constants
-    static constexpr int UPLOAD_INTERVAL_MS = 3000;  // 3 seconds upload interval
     static constexpr int SAMPLE_RATE = 16000;         // 16kHz sample rate
     static constexpr size_t BUFFER_CAPACITY_SAMPLES =
         16000 * 5;  // 5 seconds ring buffer (fixed memory: ~160KB)
+    static constexpr size_t UPLOAD_CHUNK_SAMPLES =
+        16000 * 3;  // Upload chunk size: trigger when buffer >= 3s, read up to 3s per upload
     static constexpr int UPLOAD_TASK_STACK_SIZE = 8192;  // Increased for HTTP + base64 operations
     static constexpr int UPLOAD_TASK_PRIORITY = 5;
     static constexpr int HTTP_TIMEOUT_MS = 10000;  // 10 seconds HTTP timeout
@@ -180,9 +180,6 @@ private:
 
     // Ring buffer for audio data (fixed memory allocation)
     std::unique_ptr<AudioRingBuffer> ring_buffer_;
-
-    // Timing
-    std::chrono::steady_clock::time_point last_upload_time_;
 
     // Configuration
     std::string upload_url_;
