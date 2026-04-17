@@ -2,6 +2,7 @@
 #include "audio_service.h"
 #include "system_info.h"
 #include "assets.h"
+#include "settings.h"
 
 #include <esp_log.h>
 #include <esp_mn_iface.h>
@@ -9,7 +10,51 @@
 #include <esp_mn_speech_commands.h>
 #include <cJSON.h>
 
+#include <algorithm>
+
 #define TAG "CustomWakeWord"
+
+namespace {
+
+std::vector<std::string> LoadOtaWakeupsFromSettings() {
+    Settings settings("wake_word", false);
+    std::string wakeups_json = settings.GetString("wakeups");
+    if (wakeups_json.empty()) {
+        return {};
+    }
+
+    cJSON* root = cJSON_Parse(wakeups_json.c_str());
+    if (root == nullptr || !cJSON_IsArray(root)) {
+        if (root != nullptr) {
+            cJSON_Delete(root);
+        }
+        ESP_LOGW(TAG, "Invalid wakeups JSON in settings, ignoring");
+        return {};
+    }
+
+    std::vector<std::string> wakeups;
+    for (int i = 0; i < cJSON_GetArraySize(root); i++) {
+        cJSON* item = cJSON_GetArrayItem(root, i);
+        if (!cJSON_IsString(item) || item->valuestring == nullptr) {
+            continue;
+        }
+        std::string wakeup(item->valuestring);
+        if (wakeup.empty()) {
+            continue;
+        }
+        if (std::find(wakeups.begin(), wakeups.end(), wakeup) != wakeups.end()) {
+            continue;
+        }
+        wakeups.push_back(std::move(wakeup));
+        if (wakeups.size() >= 10) {
+            break;
+        }
+    }
+    cJSON_Delete(root);
+    return wakeups;
+}
+
+}  // namespace
 
 CustomWakeWord::CustomWakeWord()
     : wake_word_pcm_(), wake_word_opus_() {
@@ -96,6 +141,15 @@ bool CustomWakeWord::Initialize(AudioCodec* codec, srmodel_list_t* models_list) 
     } else {
         models_ = models_list;
         ParseWakenetModelConfig();
+    }
+
+    auto ota_wakeups = LoadOtaWakeupsFromSettings();
+    if (!ota_wakeups.empty()) {
+        commands_.clear();
+        for (const auto& wakeup : ota_wakeups) {
+            commands_.push_back({wakeup, wakeup, "wake"});
+        }
+        ESP_LOGI(TAG, "Using OTA wakeups (%u)", (unsigned)ota_wakeups.size());
     }
 
     if (models_ == nullptr || models_->num == -1) {

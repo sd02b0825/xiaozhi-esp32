@@ -18,11 +18,28 @@
 #endif
 
 #include <cstring>
+#include <cctype>
 #include <vector>
 #include <sstream>
 #include <algorithm>
 
 #define TAG "Ota"
+
+namespace {
+
+std::string TrimWhitespace(const std::string& input) {
+    size_t begin = 0;
+    while (begin < input.size() && std::isspace(static_cast<unsigned char>(input[begin]))) {
+        begin++;
+    }
+    size_t end = input.size();
+    while (end > begin && std::isspace(static_cast<unsigned char>(input[end - 1]))) {
+        end--;
+    }
+    return input.substr(begin, end - begin);
+}
+
+}  // namespace
 
 
 Ota::Ota() {
@@ -184,6 +201,68 @@ esp_err_t Ota::CheckVersion() {
     } else {
         ESP_LOGI(TAG, "No websocket section found!");
     }
+
+    cJSON* wakeups = cJSON_GetObjectItem(root, "wakeups");
+    // cJSON* json = cJSON_Parse("{\"wakeups\":[\"xiao ai\",\"xiao ming\"]}");
+    // cJSON* wakeups = cJSON_GetObjectItem(json, "wakeups");
+    if (cJSON_IsArray(wakeups)) {
+        std::vector<std::string> wakeup_list;
+        for (int i = 0; i < cJSON_GetArraySize(wakeups); i++) {
+            cJSON* item = cJSON_GetArrayItem(wakeups, i);
+            if (!cJSON_IsString(item) || item->valuestring == nullptr) {
+                continue;
+            }
+            std::string wakeup = TrimWhitespace(item->valuestring);
+            if (wakeup.empty()) {
+                continue;
+            }
+            if (wakeup.size() > 64) {
+                ESP_LOGW(TAG, "Wakeup too long (%u), skipping", (unsigned)wakeup.size());
+                continue;
+            }
+            if (std::find(wakeup_list.begin(), wakeup_list.end(), wakeup) != wakeup_list.end()) {
+                continue;
+            
+            }
+
+            wakeup_list.push_back("ni hao "+wakeup);
+
+
+            wakeup_list.push_back(std::move(wakeup));
+            if (wakeup_list.size() >= 20) {
+                ESP_LOGW(TAG, "Too many wakeups, keeping first %u", (unsigned)wakeup_list.size());
+                break;
+            }
+            
+
+        }
+        wakeup_list.push_back("jiu ming");
+        wakeup_list.push_back("bang bang wo");
+
+        Settings settings("wake_word", true);
+        if (wakeup_list.empty()) {
+            settings.EraseKey("wakeups");
+            ESP_LOGI(TAG, "OTA wakeups cleared");
+        } else {
+            cJSON* wakeups_json = cJSON_CreateArray();
+            for (const auto& wakeup : wakeup_list) {
+                cJSON_AddItemToArray(wakeups_json, cJSON_CreateString(wakeup.c_str()));
+            }
+            char* json_str = cJSON_PrintUnformatted(wakeups_json);
+            if (json_str != nullptr) {
+                settings.SetString("wakeups", json_str);
+                cJSON_free(json_str);
+                ESP_LOGI(TAG, "OTA wakeups updated (%u)", (unsigned)wakeup_list.size());
+            } else {
+                ESP_LOGW(TAG, "Failed to encode OTA wakeups, keeping previous");
+            }
+            cJSON_Delete(wakeups_json);
+        }
+    } else {
+         Settings settings("wake_word", true);
+         settings.EraseKey("wakeups");
+    }
+    
 
     has_server_time_ = false;
     cJSON *server_time = cJSON_GetObjectItem(root, "server_time");
