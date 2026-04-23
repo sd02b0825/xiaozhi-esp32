@@ -978,7 +978,7 @@ void Application::HandleStateChangedEvent() {
             }
 #if CONFIG_ENABLE_ENVIRONMENT_SOUND_DETECTION
             // Stop background audio monitoring when entering listening mode
-            audio_monitor_.Stop();
+            audio_monitor_.Start();
 #endif
             break;
         case kDeviceStateSpeaking:
@@ -998,7 +998,7 @@ void Application::HandleStateChangedEvent() {
             audio_service_.ResetDecoder();
 #if CONFIG_ENABLE_ENVIRONMENT_SOUND_DETECTION
             // Stop background audio monitoring when entering speaking mode
-            audio_monitor_.Stop();
+            audio_monitor_.Start();
 #endif
             break;
         case kDeviceStateWifiConfiguring:
