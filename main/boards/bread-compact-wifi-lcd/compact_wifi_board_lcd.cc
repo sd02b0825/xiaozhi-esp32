@@ -8,6 +8,7 @@
 #include "mcp_server.h"
 #include "lamp_controller.h"
 #include "led/single_led.h"
+#include "bread_compact_wifi_strip_led.h"
 
 #include <esp_log.h>
 #include <driver/i2c_master.h>
@@ -58,6 +59,18 @@ static const gc9a01_lcd_init_cmd_t gc9107_lcd_init_cmds[] = {
 #endif
  
 #define TAG "CompactWifiBoardLCD"
+
+class CompactWifiLeds : public Led {
+public:
+    void OnStateChanged() override {
+        status_led_.OnStateChanged();
+        strip_led_.OnStateChanged();
+    }
+
+private:
+    SingleLed status_led_{BUILTIN_LED_GPIO};
+    BreadCompactWifiStripLed strip_led_{LED_STRIP_GPIO, LED_STRIP_COUNT};
+};
 
 class CompactWifiBoardLCD : public WifiBoard {
 private:
@@ -152,8 +165,8 @@ public:
     }
 
     virtual Led* GetLed() override {
-        static SingleLed led(BUILTIN_LED_GPIO);
-        return &led;
+        static CompactWifiLeds leds;
+        return &leds;
     }
 
     virtual AudioCodec* GetAudioCodec() override {

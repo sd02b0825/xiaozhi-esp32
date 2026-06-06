@@ -2,6 +2,7 @@
 #include "board.h"
 #include <esp_log.h>
 #include <cstring>
+#include <cmath>
 
 #define RATE_CVT_CFG(_src_rate, _dest_rate, _channel)        \
     (esp_ae_rate_cvt_cfg_t)                                  \
@@ -37,6 +38,9 @@
 #endif
 
 #define TAG "AudioService"
+
+#define PLAYBACK_AUDIO_RMS_THRESHOLD 400
+#define PLAYBACK_AUDIO_HOLD_US 150000
 
 AudioService::AudioService() {
     event_group_ = xEventGroupCreate();
@@ -313,6 +317,8 @@ void AudioService::AudioOutputTask() {
         }
 
         codec_->OutputData(task->pcm);
+
+        UpdatePlaybackLevel(task->pcm);     
 
         /* Update the last output time */
         last_output_time_ = std::chrono::steady_clock::now();
@@ -657,6 +663,29 @@ void AudioService::PlaySound(const std::string_view& ogg) {
     });
     demuxer->Reset();
     demuxer->Process(buf, size);
+}
+
+void AudioService::UpdatePlaybackLevel(const std::vector<int16_t>& pcm) {
+    if (pcm.empty()) {
+        return;
+    }
+
+    int64_t sum_squares = 0;
+    for (int16_t sample : pcm) {
+        sum_squares += static_cast<int32_t>(sample) * sample;
+    }
+    uint32_t rms = static_cast<uint32_t>(sqrt(static_cast<double>(sum_squares) / pcm.size()));
+    if (rms > PLAYBACK_AUDIO_RMS_THRESHOLD) {
+        last_playback_sound_us_.store(esp_timer_get_time());
+    }
+}
+
+bool AudioService::HasPlaybackAudio() const {
+    int64_t last_sound_us = last_playback_sound_us_.load();
+    if (last_sound_us == 0) {
+        return false;
+    }
+    return (esp_timer_get_time() - last_sound_us) < PLAYBACK_AUDIO_HOLD_US;
 }
 
 bool AudioService::IsIdle() {
