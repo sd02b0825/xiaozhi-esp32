@@ -28,6 +28,7 @@ public:
     void OnVadStateChange(std::function<void(bool speaking)> callback) override;
     size_t GetFeedSize() override;
     void EnableDeviceAec(bool enable) override;
+    void SetTaskPriority(UBaseType_t priority) override;
 
 private:
     EventGroupHandle_t event_group_ = nullptr;
@@ -41,6 +42,7 @@ private:
     std::vector<int16_t> input_buffer_;
     std::mutex input_buffer_mutex_;
     std::vector<int16_t> output_buffer_;
+    TaskHandle_t task_handle_ = nullptr;
 
     void AudioProcessorTask();
 };

@@ -19,6 +19,7 @@
 #include "esp_ae_rate_cvt.h"
 #include "esp_audio_types.h"
 
+#include "board.h"
 #include "audio_codec.h"
 #include "audio_processor.h"
 #include "processors/audio_debugger.h"
@@ -39,7 +40,7 @@
 
 #define OPUS_FRAME_DURATION_MS 60
 #define MAX_ENCODE_TASKS_IN_QUEUE 2
-#define MAX_PLAYBACK_TASKS_IN_QUEUE 2
+#define MAX_PLAYBACK_TASKS_IN_QUEUE 6
 #define MAX_DECODE_PACKETS_IN_QUEUE (2400 / OPUS_FRAME_DURATION_MS)
 #define MAX_SEND_PACKETS_IN_QUEUE (2400 / OPUS_FRAME_DURATION_MS)
 #define AUDIO_TESTING_MAX_DURATION_MS 10000
@@ -112,6 +113,8 @@ struct DebugStatistics {
     uint32_t playback_count = 0;
 };
 
+class AudioDecoder;
+
 class AudioService {
 public:
     AudioService();
@@ -126,6 +129,7 @@ public:
     bool IsVoiceDetected() const { return voice_detected_; }
     bool HasPlaybackAudio() const;
     bool IsIdle();
+    bool IsPlaybackBusy();
     void WaitForPlaybackQueueEmpty();
     bool IsWakeWordRunning() const { return xEventGroupGetBits(event_group_) & AS_EVENT_WAKE_WORD_RUNNING; }
     bool IsAudioProcessorRunning() const { return xEventGroupGetBits(event_group_) & AS_EVENT_AUDIO_PROCESSOR_RUNNING; }
@@ -146,11 +150,15 @@ public:
     bool ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples);
     void ResetDecoder();
     void SetModelsList(srmodel_list_t* models_list);
+#if CONFIG_USE_AUDIO_PROCESSOR
+    void SetProcessorTaskPriority(UBaseType_t priority);
+#endif
 
 private:
     AudioCodec* codec_ = nullptr;
     AudioServiceCallbacks callbacks_;
     std::unique_ptr<AudioProcessor> audio_processor_;
+    std::unique_ptr<AudioDecoder> audio_decoder_;
     std::unique_ptr<WakeWord> wake_word_;
     std::unique_ptr<AudioDebugger> audio_debugger_;
     void* opus_encoder_ = nullptr;
@@ -169,6 +177,7 @@ private:
     int decoder_duration_ms_ = OPUS_FRAME_DURATION_MS;
     int decoder_frame_size_ = 0;
     DebugStatistics debug_statistics_;
+    std::atomic<bool> playback_busy_ = false;
     srmodel_list_t* models_list_ = nullptr;
 
     EventGroupHandle_t event_group_;
@@ -204,7 +213,9 @@ private:
     void AudioOutputTask();
     void OpusCodecTask();
     void PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t>&& pcm);
+    bool DecodePacketToPcm(const AudioStreamPacket& packet, AudioTask& task);
     void SetDecodeSampleRate(int sample_rate, int frame_duration);
+    bool ResamplePlaybackTask(AudioTask& task, int sample_rate, int channels);
     void CheckAndUpdateAudioPowerState();
 
     

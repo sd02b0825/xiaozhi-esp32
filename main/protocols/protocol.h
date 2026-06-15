@@ -12,6 +12,11 @@ struct AudioStreamPacket {
     int frame_duration = 0;
     uint32_t timestamp = 0;
     std::vector<uint8_t> payload;
+
+    // 以下为 SDK 多格式扩展字段
+    std::string codec;          // "opus", "pcm", "wav", "mp3"
+    int channels = 1;           // PCM/WAV 声道数
+    int bits_per_sample = 16;   // PCM/WAV 位深
 };
 
 struct BinaryProtocol2 {

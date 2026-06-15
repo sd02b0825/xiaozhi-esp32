@@ -2,6 +2,8 @@
 set(SOURCES "audio/audio_codec.cc"
             "audio/audio_service.cc"
             "audio/audio_monitor.cc"
+            "audio/audio_decoder.cc"
+            "audio/lingxin_sdk_bridge.cc"
             "audio/demuxer/ogg_demuxer.cc"
             "audio/codecs/no_audio_codec.cc"
             "audio/codecs/box_audio_codec.cc"
@@ -30,6 +32,7 @@ set(SOURCES "audio/audio_codec.cc"
             "protocols/protocol.cc"
             "protocols/mqtt_protocol.cc"
             "protocols/websocket_protocol.cc"
+            "protocols/lingxin_sdk_protocol.cc"
             "mcp_server.cc"
             "system_info.cc"
             "application.cc"
@@ -913,6 +916,8 @@ idf_component_register(SRCS ${SOURCES}
                         efuse
                         bt
                         fatfs
+                        esp_audio_codec
+                        LINGXIN_SDK
                     )
 
 # Use target_compile_definitions to define BOARD_TYPE, BOARD_NAME

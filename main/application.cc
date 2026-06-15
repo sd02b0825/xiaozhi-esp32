@@ -5,6 +5,9 @@
 #include "audio_codec.h"
 #include "mqtt_protocol.h"
 #include "websocket_protocol.h"
+#if CONFIG_LINGXIN_SDK_ENABLE
+#include "lingxin_sdk_protocol.h"
+#endif
 #include "assets/lang_config.h"
 #include "mcp_server.h"
 #include "assets.h"
@@ -225,6 +228,7 @@ void Application::Run() {
             HandleStopListeningEvent();
         }
 
+#if !CONFIG_LINGXIN_SDK_ENABLE
         if (bits & MAIN_EVENT_SEND_AUDIO) {
             while (auto packet = audio_service_.PopPacketFromSendQueue()) {
                 if (protocol_ && !protocol_->SendAudio(std::move(packet))) {
@@ -232,6 +236,7 @@ void Application::Run() {
                 }
             }
         }
+#endif
 
         if (bits & MAIN_EVENT_WAKE_WORD_DETECTED) {
             HandleWakeWordDetectedEvent();
@@ -418,7 +423,7 @@ void Application::CheckAssetsVersion() {
 }
 
 void Application::CheckNewVersion() {
-    const int MAX_RETRY = 10;
+    const int MAX_RETRY = 1;
     int retry_count = 0;
     int retry_delay = 10; // Initial retry delay in seconds
 
@@ -499,13 +504,16 @@ void Application::InitializeProtocol() {
 
     display->SetStatus(Lang::Strings::LOADING_PROTOCOL);
 
+#if CONFIG_LINGXIN_SDK_ENABLE
+    ESP_LOGI(TAG, "Lingxin SDK enabled, using Lingxin SDK protocol");
+    protocol_ = std::make_unique<LingxinSdkProtocol>();
+#else
     if (ota_->HasMqttConfig()) {
         protocol_ = std::make_unique<MqttProtocol>();
 #if CONFIG_ENABLE_ENVIRONMENT_SOUND_DETECTION
-        // Set client_id for audio monitor from MQTT settings
         Settings settings("mqtt", false);
         audio_monitor_.SetClientId(settings.GetString("client_id"));
-        if (ota_) {  // 添加空指针检查
+        if (ota_) {
             audio_monitor_.SetUploadUrl(ota_->GetAudioMonitorUrl());
         }
 #endif
@@ -515,14 +523,14 @@ void Application::InitializeProtocol() {
         ESP_LOGW(TAG, "No protocol specified in the OTA config, using MQTT");
         protocol_ = std::make_unique<MqttProtocol>();
 #if CONFIG_ENABLE_ENVIRONMENT_SOUND_DETECTION
-        // Set client_id for audio monitor from MQTT settings
         Settings settings("mqtt", false);
         audio_monitor_.SetClientId(settings.GetString("client_id"));
-        if (ota_) {  // 添加空指针检查
+        if (ota_) {
             audio_monitor_.SetUploadUrl(ota_->GetAudioMonitorUrl());
         }
 #endif
     }
+#endif
 
     protocol_->OnConnected([this]() {
         DismissAlert();
@@ -557,8 +565,60 @@ void Application::InitializeProtocol() {
     });
     
     protocol_->OnIncomingJson([this, display](const cJSON* root) {
+#if CONFIG_LINGXIN_SDK_ENABLE
+        auto header = cJSON_GetObjectItem(root, "header");
+        auto action = header ? cJSON_GetObjectItem(header, "action") : nullptr;
+        if (cJSON_IsString(action) && strcmp(action->valuestring, "text_output") == 0) {
+            auto payload = cJSON_GetObjectItem(root, "payload");
+            if (cJSON_IsObject(payload)) {
+                auto text = cJSON_GetObjectItem(payload, "text");
+                if (cJSON_IsString(text)) {
+                    ESP_LOGI(TAG, "<< %s", text->valuestring);
+                    Schedule([display, message = std::string(text->valuestring)]() {
+                        display->SetChatMessage("assistant", message.c_str());
+                    });
+                }
+            }
+            return;
+        }
+        if (cJSON_IsString(action) && strcmp(action->valuestring, "asr_ended") == 0) {
+            auto payload = cJSON_GetObjectItem(root, "payload");
+            if (cJSON_IsObject(payload)) {
+                auto text = cJSON_GetObjectItem(payload, "text");
+                if (cJSON_IsString(text)) {
+                    ESP_LOGI(TAG, ">> %s", text->valuestring);
+                    Schedule([display, message = std::string(text->valuestring)]() {
+                        display->SetChatMessage("user", message.c_str());
+                    });
+                }
+            }
+            return;
+        }
+        if (cJSON_IsString(action) && strcmp(action->valuestring, "task_started") == 0) {
+            Schedule([this]() {
+                aborted_ = false;
+                SetDeviceState(kDeviceStateSpeaking);
+            });
+            return;
+        }
+        if (cJSON_IsString(action) && strcmp(action->valuestring, "audio_ended") == 0) {
+            Schedule([this]() {
+                if (GetDeviceState() == kDeviceStateSpeaking) {
+                    if (listening_mode_ == kListeningModeManualStop) {
+                        SetDeviceState(kDeviceStateIdle);
+                    } else {
+                        SetDeviceState(kDeviceStateListening);
+                    }
+                }
+            });
+            return;
+        }
+#endif
         // Parse JSON data
         auto type = cJSON_GetObjectItem(root, "type");
+        if (type == nullptr || !cJSON_IsString(type)) {
+            return;
+        }
         if (strcmp(type->valuestring, "tts") == 0) {
             auto state = cJSON_GetObjectItem(root, "state");
             if (strcmp(state->valuestring, "start") == 0) {
@@ -877,7 +937,7 @@ void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
     }
 
     ESP_LOGI(TAG, "Wake word detected: %s", wake_word.c_str());
-#if CONFIG_SEND_WAKE_WORD_DATA
+#if CONFIG_SEND_WAKE_WORD_DATA && !CONFIG_LINGXIN_SDK_ENABLE
     // Encode and send the wake word data to the server
     while (auto packet = audio_service_.PopWakeWordPacket()) {
         protocol_->SendAudio(std::move(packet));
