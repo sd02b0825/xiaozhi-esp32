@@ -1,5 +1,5 @@
 tmp/
-components/
+
 managed_components/
 build/
 dist/
@@ -18,3 +18,4 @@ main/mmap_generate_emoji.h
 *.bin
 mmap_generate_*.h
 .clangd
+.trae/
