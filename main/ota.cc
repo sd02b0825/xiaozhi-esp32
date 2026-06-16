@@ -331,6 +331,34 @@ esp_err_t Ota::CheckVersion() {
         ESP_LOGI(TAG, "No audiomonitor section found!");
     }
 
+    cJSON *lingxin_json = cJSON_GetObjectItem(root, "lingXin");
+    if (cJSON_IsObject(lingxin_json)) {
+        cJSON *inner_json = cJSON_GetObjectItem(lingxin_json, "json");
+        if (cJSON_IsString(inner_json) && inner_json->valuestring != nullptr) {
+            // Parse the inner JSON string
+            cJSON *inner_root = cJSON_Parse(inner_json->valuestring);
+            if (inner_root != nullptr) {
+                Settings settings("lingxin", true);
+                cJSON *item = NULL;
+                cJSON_ArrayForEach(item, inner_root) {
+                    if (cJSON_IsString(item)) {
+                        settings.SetString(item->string, item->valuestring);
+                    } else if (cJSON_IsNumber(item)) {
+                        settings.SetInt(item->string, item->valueint);
+                    }
+                }
+                cJSON_Delete(inner_root);
+                has_lingxin_config_ = true;
+                ESP_LOGI(TAG, "Lingxin config written to NVS");
+            } else {
+                ESP_LOGE(TAG, "Failed to parse lingxin inner JSON");
+            }
+        } else {
+            ESP_LOGI(TAG, "No json field in lingXin section");
+        }
+    } else {
+        ESP_LOGI(TAG, "No lingXin section found");
+    }
 
     cJSON_Delete(root);
     return ESP_OK;

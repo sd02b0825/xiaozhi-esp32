@@ -504,31 +504,25 @@ void Application::InitializeProtocol() {
 
     display->SetStatus(Lang::Strings::LOADING_PROTOCOL);
 
+#if CONFIG_ENABLE_ENVIRONMENT_SOUND_DETECTION
+        Settings settings("mqtt", false);
+        audio_monitor_.SetClientId(settings.GetString("client_id"));
+        if (ota_) {
+            audio_monitor_.SetUploadUrl(ota_->GetAudioMonitorUrl());
+        }
+#endif
+
 #if CONFIG_LINGXIN_SDK_ENABLE
     ESP_LOGI(TAG, "Lingxin SDK enabled, using Lingxin SDK protocol");
     protocol_ = std::make_unique<LingxinSdkProtocol>();
 #else
     if (ota_->HasMqttConfig()) {
         protocol_ = std::make_unique<MqttProtocol>();
-#if CONFIG_ENABLE_ENVIRONMENT_SOUND_DETECTION
-        Settings settings("mqtt", false);
-        audio_monitor_.SetClientId(settings.GetString("client_id"));
-        if (ota_) {
-            audio_monitor_.SetUploadUrl(ota_->GetAudioMonitorUrl());
-        }
-#endif
     } else if (ota_->HasWebsocketConfig()) {
         protocol_ = std::make_unique<WebsocketProtocol>();
     } else {
         ESP_LOGW(TAG, "No protocol specified in the OTA config, using MQTT");
         protocol_ = std::make_unique<MqttProtocol>();
-#if CONFIG_ENABLE_ENVIRONMENT_SOUND_DETECTION
-        Settings settings("mqtt", false);
-        audio_monitor_.SetClientId(settings.GetString("client_id"));
-        if (ota_) {
-            audio_monitor_.SetUploadUrl(ota_->GetAudioMonitorUrl());
-        }
-#endif
     }
 #endif
 

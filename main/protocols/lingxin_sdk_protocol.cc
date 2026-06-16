@@ -381,7 +381,7 @@ void LingxinSdkProtocol::ClearChatSessionFlags() {
 
 bool LingxinSdkProtocol::Start() {
     ESP_LOGI(TAG, "Initializing LingXin SDK voice_chat");
-    LoadRuntimeConfig();
+    // LoadRuntimeConfig();
 
     VoiceChatInitProps props = get_voice_chat_init_default_props();
     props.auth_app_id_get_func = GetAppId;
