@@ -25,6 +25,7 @@ static local_audio_handle_t local_audio_player;
  * Maps SDK audio path to AudioService::PlaySound or direct playback.
  */
 extern void audio_service_play_local_sound(const char *audio_path);
+extern void audio_service_set_output_volume(int volume);
 
 lingxin_local_player_t lingxin_local_player_create()
 {
@@ -63,8 +64,8 @@ play_err:
 
 void lingxin_local_player_set_volume(lingxin_local_player_t player, int volume)
 {
-    /* Volume managed by AudioService/Board in v2.6.6 */
-    lingxin_log_debug("Volume set request: %d (managed by AudioService)", volume);
+    (void)player;
+    audio_service_set_output_volume(volume);
 }
 
 void lingxin_local_player_destory(lingxin_local_player_t player)

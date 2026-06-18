@@ -106,6 +106,11 @@ public:
      */
     void StopListening();
 
+    /**
+     * 结束当前对话并进入待命（待机）状态。
+     */
+    void EnterStandby();
+
     void Reboot();
     void WakeWordInvoke(const std::string& wake_word);
     bool UpgradeFirmware(const std::string& url, const std::string& version = "");

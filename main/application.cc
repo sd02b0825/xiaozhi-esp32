@@ -7,7 +7,9 @@
 #include "websocket_protocol.h"
 #if CONFIG_LINGXIN_SDK_ENABLE
 #include "lingxin_sdk_protocol.h"
+#include "lingxin_sdk_bridge.h"
 #endif
+#include "lingxin_device_command.h"
 #include "assets/lang_config.h"
 #include "mcp_server.h"
 #include "assets.h"
@@ -551,6 +553,9 @@ void Application::InitializeProtocol() {
     
     protocol_->OnAudioChannelClosed([this, &board]() {
         board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+#if CONFIG_LINGXIN_SDK_ENABLE
+        lingxin_set_standby_exit_in_progress(0);
+#endif
         Schedule([this]() {
             auto display = Board::GetInstance().GetDisplay();
             display->SetChatMessage("system", "");
@@ -581,6 +586,9 @@ void Application::InitializeProtocol() {
                 auto text = cJSON_GetObjectItem(payload, "text");
                 if (cJSON_IsString(text)) {
                     ESP_LOGI(TAG, ">> %s", text->valuestring);
+                    if (lingxin_device_command_try_handle_user_text(text->valuestring)) {
+                        return;
+                    }
                     Schedule([display, message = std::string(text->valuestring)]() {
                         display->SetChatMessage("user", message.c_str());
                     });
@@ -643,6 +651,9 @@ void Application::InitializeProtocol() {
             auto text = cJSON_GetObjectItem(root, "text");
             if (cJSON_IsString(text)) {
                 ESP_LOGI(TAG, ">> %s", text->valuestring);
+                if (lingxin_device_command_try_handle_user_text(text->valuestring)) {
+                    return;
+                }
                 Schedule([display, message = std::string(text->valuestring)]() {
                     display->SetChatMessage("user", message.c_str());
                 });
@@ -764,6 +775,35 @@ void Application::StartListening() {
 
 void Application::StopListening() {
     xEventGroupSetBits(event_group_, MAIN_EVENT_STOP_LISTENING);
+}
+
+void Application::EnterStandby() {
+    Schedule([this]() {
+        const auto state = GetDeviceState();
+        if (state == kDeviceStateIdle || state == kDeviceStateActivating ||
+            state == kDeviceStateWifiConfiguring || state == kDeviceStateUpgrading ||
+            state == kDeviceStateAudioTesting) {
+            return;
+        }
+
+#if CONFIG_LINGXIN_SDK_ENABLE
+        lingxin_set_standby_exit_in_progress(1);
+#endif
+
+        /* 正常退出对话只走 exit_chat，不要叠加 Wakeup_Detected 打断，避免 SDK 状态机冲突重启 */
+        if (protocol_ && protocol_->IsAudioChannelOpened()) {
+            protocol_->CloseAudioChannel();
+            return;
+        }
+
+        if (state == kDeviceStateListening || state == kDeviceStateConnecting ||
+            state == kDeviceStateSpeaking) {
+            SetDeviceState(kDeviceStateIdle);
+        }
+#if CONFIG_LINGXIN_SDK_ENABLE
+        lingxin_set_standby_exit_in_progress(0);
+#endif
+    });
 }
 
 void Application::HandleToggleChatEvent() {
@@ -1000,12 +1040,20 @@ void Application::HandleStateChangedEvent() {
             audio_monitor_.Stop();
 #endif
             break;
-        case kDeviceStateListening:
+        case kDeviceStateListening: {
             display->SetStatus(Lang::Strings::LISTENING);
             display->SetEmotion("neutral");
 
             // Make sure the audio processor is running
-            if (play_popup_on_listening_ || !audio_service_.IsAudioProcessorRunning()) {
+#if CONFIG_LINGXIN_SDK_ENABLE
+            /* Lingxin enables VP in schedule_recorder_uplink_begin; starting AFE here
+             * competes with MP3 downlink decode and causes occasional playback underrun. */
+            const bool lingxin_should_enable_vp = audio_service_is_sdk_uplink_active();
+#else
+            const bool lingxin_should_enable_vp = true;
+#endif
+            if (lingxin_should_enable_vp &&
+                (play_popup_on_listening_ || !audio_service_.IsAudioProcessorRunning())) {
                 // For auto mode, wait for playback queue to be empty before enabling voice processing
                 // This prevents audio truncation when STOP arrives late due to network jitter
                 if (listening_mode_ == kListeningModeAutoStop) {
@@ -1035,6 +1083,7 @@ void Application::HandleStateChangedEvent() {
             audio_monitor_.Start();
 #endif
             break;
+        }
         case kDeviceStateSpeaking:
             display->SetStatus(Lang::Strings::SPEAKING);
 
@@ -1049,7 +1098,10 @@ void Application::HandleStateChangedEvent() {
                 audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());
 #endif
             }
+#if !CONFIG_LINGXIN_SDK_ENABLE
+            /* Lingxin pushes downlink into decode queue before/as speaking starts; must not flush it. */
             audio_service_.ResetDecoder();
+#endif
 #if CONFIG_ENABLE_ENVIRONMENT_SOUND_DETECTION
             // Stop background audio monitoring when entering speaking mode
             audio_monitor_.Start();
@@ -1074,6 +1126,12 @@ void Application::Schedule(std::function<void()>&& callback) {
 }
 
 void Application::AbortSpeaking(AbortReason reason) {
+#if CONFIG_LINGXIN_SDK_ENABLE
+    if (lingxin_standby_exit_in_progress()) {
+        ESP_LOGI(TAG, "Skip abort speaking during standby exit");
+        return;
+    }
+#endif
     ESP_LOGI(TAG, "Abort speaking");
     aborted_ = true;
     if (protocol_) {
@@ -1159,6 +1217,13 @@ void Application::WakeWordInvoke(const std::string& wake_word) {
     if (!protocol_) {
         return;
     }
+
+#if CONFIG_LINGXIN_SDK_ENABLE
+    if (lingxin_standby_exit_in_progress()) {
+        ESP_LOGI(TAG, "Skip wake word invoke during standby exit");
+        return;
+    }
+#endif
 
     auto state = GetDeviceState();
     

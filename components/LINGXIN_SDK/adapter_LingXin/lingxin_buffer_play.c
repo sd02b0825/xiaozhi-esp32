@@ -67,6 +67,10 @@ static void buffer_play_apply_downlink_format(void)
  */
 extern void audio_service_push_decode_packet(const uint8_t *data, int len, const char *codec, int sample_rate);
 extern void audio_service_reset_decoder(void);
+extern void audio_service_begin_downlink_playback(void);
+extern void audio_service_flush_playback_pending(void);
+extern void audio_service_set_output_volume(int volume);
+extern void lingxin_clear_volume_command_suppress(void);
 
 void module_bufferPlay_audioInit(PlaybackEventHandler callback, void *user_data)
 {
@@ -83,6 +87,8 @@ void module_bufferPlay_audioInit(PlaybackEventHandler callback, void *user_data)
 
     buffer_play_apply_downlink_format();
     s_need_format_refresh_on_first_packet = 1;
+
+    audio_service_begin_downlink_playback();
 
     ESP_LOGI(TAG, "bufferPlay audioInit, codec=%s, sample_rate=%d", g_current_codec, g_current_sample_rate);
 
@@ -131,6 +137,9 @@ void module_bufferPlay_audioEnd()
     }
     lingxin_log_debug("audio buffer send finish");
 
+    audio_service_flush_playback_pending();
+    lingxin_clear_volume_command_suppress();
+
     if (g_callback) {
         g_callback(Lingxin_Download_Audio_PlayEnd, g_user_data);
     } else {
@@ -162,8 +171,7 @@ void module_bufferPlay_terminate()
 
 void module_bufferPlay_setVolume(int volume)
 {
-    /* Volume is managed by AudioService/Board in v2.6.6 */
-    lingxin_log_debug("Volume set request: %d (managed by AudioService)", volume);
+    audio_service_set_output_volume(volume);
 }
 
 bool module_bufferPlay_formatCheck(char *format)

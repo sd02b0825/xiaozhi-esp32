@@ -90,7 +90,8 @@ int lingxin_record_write_pcm(const uint8_t *data, size_t len)
     if (g_record_ringbuf == NULL || data == NULL || len == 0) {
         return -1;
     }
-    BaseType_t ret = xRingbufferSend(g_record_ringbuf, data, len, pdMS_TO_TICKS(100));
+    /* Non-blocking: AFE fetch callback must never wait on a full ringbuf. */
+    BaseType_t ret = xRingbufferSend(g_record_ringbuf, data, len, 0);
     if (ret != pdTRUE) {
         s_ringbuf_fail_count++;
         int64_t now = esp_timer_get_time();
@@ -124,14 +125,22 @@ static void audio_processing_task(void *arg)
 
     lingxin_log_debug("audio_processing_task started, frame_size=%d", hdl->frame_size);
 
-    while (hdl && !hdl->should_stop) {
-        size_t actual_size = 0;
-        void *item = xRingbufferReceive(hdl->ringbuf, &actual_size, pdMS_TO_TICKS(10));
+    /* 每轮最多处理 8KB 后让出 CPU，避免 ringbuf 积压时饿死 IDLE 触发 WDT */
+    const size_t kYieldBatchBytes = 8192;
 
-        if (item != NULL && actual_size > 0) {
+    while (hdl && !hdl->should_stop) {
+        size_t processed = 0;
+        while (processed < kYieldBatchBytes) {
+            size_t actual_size = 0;
+            void *item = xRingbufferReceive(hdl->ringbuf, &actual_size, 0);
+            if (item == NULL || actual_size == 0) {
+                break;
+            }
             feed_pcm_in_frames(hdl, (const uint8_t *)item, actual_size);
             vRingbufferReturnItem(hdl->ringbuf, item);
+            processed += actual_size;
         }
+        vTaskDelay(pdMS_TO_TICKS(1));
     }
 
     lingxin_log_debug("audio_processing_task exiting");
@@ -161,8 +170,6 @@ lingxin_recorder_t lingxin_recorder_create()
         lingxin_log_ut_with_args(LINGXIN_ERROR, "adapter_recorder_create_fail", "Failed to create record ringbuf");
         goto create_fail;
     }
-    g_record_ringbuf = hdl->ringbuf;
-
     lingxin_log_ut(LINGXIN_DEBUG, "adapter_recorder_create_success");
     return (lingxin_recorder_t)hdl;
 
@@ -193,12 +200,15 @@ void lingxin_recorder_finish_open(void *recorder)
     lingxin_recorder_callback_t callback = hdl->open_callback;
     hdl->open_callback = NULL;
 
+    /* Consumer must be ready before AFE starts pushing PCM into the ringbuf. */
+    g_record_ringbuf = hdl->ringbuf;
+
     char task_name[32];
     long now_time = lingxin_get_timestamp_s();
     snprintf(task_name, sizeof(task_name), "lx_r_%ld", now_time);
     lingxin_log_debug("create audio processing task: %s", task_name);
 
-    BaseType_t task_ret = xTaskCreate(audio_processing_task, task_name, 4096, hdl, 5, NULL);
+    BaseType_t task_ret = xTaskCreatePinnedToCore(audio_processing_task, task_name, 4096, hdl, 8, NULL, 1);
     if (task_ret != pdPASS) {
         lingxin_log_error("Failed to create audio processing task");
         g_record_ringbuf = NULL;
@@ -248,8 +258,7 @@ void lingxin_recorder_open(lingxin_recorder_t recorder, lingxin_recorder_open_pa
         vRingbufferReturnItem(hdl->ringbuf, dummy_item);
     }
 
-    g_record_ringbuf = hdl->ringbuf;
-
+    /* g_record_ringbuf is published in lingxin_recorder_finish_open after consumer task starts. */
     extern void audio_service_schedule_recorder_uplink_begin(void *recorder_hdl);
     audio_service_schedule_recorder_uplink_begin(recorder);
     return;

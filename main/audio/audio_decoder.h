@@ -35,6 +35,8 @@ private:
     int resampler_dst_rate_ = 0;
     std::mutex decoder_mutex_;
     std::mutex resampler_mutex_;
+    /* Reused across DecodeMp3 calls to avoid per-packet heap alloc stalls. */
+    std::vector<uint8_t> mp3_decode_buf_;
 
     bool OpenMp3Decoder();
     void CloseMp3Decoder();

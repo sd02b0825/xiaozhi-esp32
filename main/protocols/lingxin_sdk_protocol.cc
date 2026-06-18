@@ -8,6 +8,8 @@
 
 #include "lingxin_sdk_protocol.h"
 #include "lingxin_sdk_bridge.h"
+#include "lingxin_device_command.h"
+#include "lingxin_device_command_listener.h"
 #include "audio_service.h"
 #include "application.h"
 #include "device_state.h"
@@ -17,13 +19,35 @@ extern "C" {
 #include "chat_state_machine_event.h"
 #include "audio_buffer_play.h"
 }
+#include "display.h"
 #include "esp_log.h"
 #include <cJSON.h>
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 #include <string>
 
 static const char *TAG = "LingxinSdkProtocol";
+
+static bool IsVolumeDenialAgentText(const char* text)
+{
+    if (text == nullptr || text[0] == '\0') {
+        return false;
+    }
+    return strstr(text, "无法") != nullptr && strstr(text, "音量") != nullptr;
+}
+
+static bool IsStandbyMisinterpretedMuteAgentText(const char* text)
+{
+    if (text == nullptr || text[0] == '\0') {
+        return false;
+    }
+    /* 云端常把单说「关闭」误解为关声音，并在回复里顺带询问是否休息。 */
+    const bool mentions_sound_off = strstr(text, "声音") != nullptr &&
+                                    (strstr(text, "关掉") != nullptr || strstr(text, "关了") != nullptr ||
+                                     strstr(text, "关上") != nullptr);
+    return mentions_sound_off && strstr(text, "休息") != nullptr;
+}
 
 LingxinSdkProtocol* LingxinSdkProtocol::instance_ = nullptr;
 
@@ -194,6 +218,10 @@ void LingxinSdkProtocol::ApplyChatPhase(ChatPhaseCode phase) {
         break;
 
     case CHAT_PHASE_INPUTING:
+        lingxin_clear_volume_command_suppress();
+        lingxin_clear_standby_after_playback();
+        lingxin_set_standby_exit_in_progress(0);
+        lingxin_device_command_clear_turn_state();
         audio_channel_opened_ = true;
         pending_outputing_ = false;
         if (on_audio_channel_opened_) {
@@ -206,11 +234,14 @@ void LingxinSdkProtocol::ApplyChatPhase(ChatPhaseCode phase) {
         break;
 
     case CHAT_PHASE_THINKING:
+        /* Download init (phase 3): stop AFE before first MP3 packet to free CPU for decode. */
+        audio_service_begin_downlink_playback();
         break;
 
     case CHAT_PHASE_OUTPUTING:
         pending_outputing_ = true;
-        if (audio_service_is_playback_busy()) {
+        audio_service_begin_downlink_playback();
+        if (!lingxin_should_suppress_cloud_tts() && audio_service_is_playback_busy()) {
             app.SetDeviceState(kDeviceStateSpeaking);
         }
         break;
@@ -240,6 +271,10 @@ void LingxinSdkProtocol::ApplyChatPhase(ChatPhaseCode phase) {
 
 void LingxinSdkProtocol::OnDownlinkStarted() {
     if (!pending_outputing_) {
+        return;
+    }
+    if (lingxin_should_suppress_cloud_tts()) {
+        ESP_LOGI(TAG, "Skip speaking state: volume handled locally, cloud TTS suppressed");
         return;
     }
     auto& app = Application::GetInstance();
@@ -312,24 +347,91 @@ void LingxinSdkProtocol::HandleChatPhaseChange(ChatPhaseCode phase) {
 }
 
 void LingxinSdkProtocol::HandleTextOut(char *text) {
-    if (text && on_incoming_json_) {
-        cJSON *root = cJSON_Parse(text);
-        if (root) {
-            cJSON *header_obj = cJSON_GetObjectItem(root, "header");
-            cJSON *action = cJSON_IsObject(header_obj) ? cJSON_GetObjectItem(header_obj, "action") : nullptr;
-            if (!cJSON_IsString(action)) {
-                if (!cJSON_IsObject(header_obj)) {
-                    header_obj = cJSON_CreateObject();
-                    cJSON_AddItemToObject(root, "header", header_obj);
-                }
-                cJSON_AddStringToObject(header_obj, "action", "text_output");
-            }
-            on_incoming_json_(root);
+    if (!text) {
+        return;
+    }
+
+    cJSON *root = cJSON_Parse(text);
+    if (!root) {
+        ESP_LOGW(TAG, "HandleTextOut: JSON parse failed, raw text: %.200s", text);
+        free(text);
+        return;
+    }
+
+    lingxin_device_command_note_text_output(root);
+    if (lingxin_device_command_try_handle_pending_user_text()) {
+        ESP_LOGI(TAG, "Handled standby from cached user text");
+        audio_service_reset_decoder();
+        cJSON_Delete(root);
+        free(text);
+        return;
+    }
+
+    const cJSON *type_field = cJSON_GetObjectItemCaseSensitive(root, "type");
+    if (cJSON_IsString(type_field) && type_field->valuestring != nullptr &&
+        strcmp(type_field->valuestring, "agent_response_text") == 0) {
+        const cJSON *result_field = cJSON_GetObjectItemCaseSensitive(root, "result");
+        const cJSON *text_field = cJSON_GetObjectItemCaseSensitive(root, "text");
+        const char *agent_text = cJSON_IsString(result_field) ? result_field->valuestring
+                              : (cJSON_IsString(text_field) ? text_field->valuestring : nullptr);
+
+        if (IsStandbyMisinterpretedMuteAgentText(agent_text) ||
+            lingxin_device_command_is_mute_reply_for_standby(agent_text)) {
+            ESP_LOGI(TAG, "Correct cloud mute misinterpretation for 关闭, entering standby");
+            lingxin_set_suppress_cloud_tts(1);
+            lingxin_set_standby_exit_in_progress(1);
+            audio_service_reset_decoder();
+            Application::GetInstance().EnterStandby();
             cJSON_Delete(root);
-        } else {
-            ESP_LOGW(TAG, "HandleTextOut: JSON parse failed, raw text: %.128s", text);
+            free(text);
+            return;
+        }
+
+        if (lingxin_device_command_is_standby_farewell_agent_text(agent_text)) {
+            ESP_LOGI(TAG, "Standby farewell detected, enter standby after TTS");
+            lingxin_mark_standby_after_playback();
+        }
+
+        if (lingxin_volume_command_handled_this_turn() && IsVolumeDenialAgentText(agent_text)) {
+            const int target = lingxin_get_last_volume_command_target();
+            lingxin_set_suppress_cloud_tts(1);
+            ESP_LOGI(TAG, "Suppress conflicting volume denial TTS (target=%d)", target);
+            auto display = Board::GetInstance().GetDisplay();
+            if (display != nullptr) {
+                std::string message = "好的，已为您调整音量";
+                if (target >= 0) {
+                    message += "至" + std::to_string(target);
+                }
+                display->SetChatMessage("assistant", message.c_str());
+            }
+            cJSON_Delete(root);
+            free(text);
+            return;
         }
     }
+
+    if (lingxin_device_command_try_handle_json(root)) {
+        ESP_LOGI(TAG, "Handled device command from text_output");
+        cJSON_Delete(root);
+        free(text);
+        return;
+    }
+
+    // INFO 级别便于确认云端实际下发的 text_output 结构
+    ESP_LOGI(TAG, "text_output payload: %.300s", text);
+
+    if (on_incoming_json_) {
+        // SDK 传入的是 payload 对象，需包装成 application 期望的 header+payload 结构
+        cJSON *message = cJSON_CreateObject();
+        cJSON *header_obj = cJSON_CreateObject();
+        cJSON_AddStringToObject(header_obj, "action", "text_output");
+        cJSON_AddItemToObject(message, "header", header_obj);
+        cJSON_AddItemToObject(message, "payload", cJSON_Duplicate(root, 1));
+        on_incoming_json_(message);
+        cJSON_Delete(message);
+    }
+
+    cJSON_Delete(root);
     free(text);
 }
 
@@ -347,9 +449,23 @@ void LingxinSdkProtocol::HandleExit(ExitCode exit_code, char *reason) {
 void LingxinSdkProtocol::HandlePlayEnd() {
     ESP_LOGI(TAG, "HandlePlayEnd");
     pending_outputing_ = false;
+    const bool standby_after_playback = lingxin_standby_after_playback_pending() != 0;
+    lingxin_clear_volume_command_suppress();
     auto& app = Application::GetInstance();
     app.GetAudioService().WaitForPlaybackQueueEmpty();
     if (audio_service_is_sdk_uplink_active()) {
+        return;
+    }
+    if (standby_after_playback) {
+        lingxin_clear_standby_after_playback();
+        lingxin_set_standby_exit_in_progress(1);
+        ESP_LOGI(TAG, "Playback finished, entering standby");
+        if (IsAudioChannelOpened()) {
+            CloseAudioChannel();
+        } else {
+            app.SetDeviceState(kDeviceStateIdle);
+            lingxin_set_standby_exit_in_progress(0);
+        }
         return;
     }
     if (app.GetDeviceState() == kDeviceStateSpeaking) {
@@ -408,6 +524,7 @@ bool LingxinSdkProtocol::Start() {
     }
 
     sdk_initialized_ = true;
+    lingxin_adapter_init_device_command_listener();
     ESP_LOGI(TAG, "LingXin SDK initialized successfully");
     return true;
 }
@@ -494,6 +611,10 @@ void LingxinSdkProtocol::SendStopListening() {
 
 void LingxinSdkProtocol::SendAbortSpeaking(AbortReason reason) {
     (void)reason;
+    if (lingxin_standby_exit_in_progress()) {
+        ESP_LOGI(TAG, "Skip SendAbortSpeaking during standby exit");
+        return;
+    }
     ESP_LOGI(TAG, "SendAbortSpeaking: SDK terminate (Wakeup_Detected)");
 
     if (!sdk_initialized_ || !chat_session_active_) {

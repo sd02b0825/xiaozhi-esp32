@@ -128,7 +128,8 @@ void AudioService::Initialize(AudioCodec* codec) {
             return;
         }
 #endif
-        PushTaskToEncodeQueue(kAudioTaskTypeEncodeToSendQueue, std::move(data));
+        // Never block AFE fetch callback path; drop frame if encode queue is full.
+        PushTaskToEncodeQueue(kAudioTaskTypeEncodeToSendQueue, std::move(data), false);
     });
 
     audio_processor_->OnVadStateChange([this](bool speaking) {
@@ -165,12 +166,12 @@ void AudioService::Start() {
         vTaskDelete(NULL);
     }, "audio_input", 2048 * 3, this, 8, &audio_input_task_handle_, 0);
 
-    /* Start the audio output task */
-    xTaskCreate([](void* arg) {
+    /* Start the audio output task (core 1, high prio for smooth I2S feed during MP3 downlink) */
+    xTaskCreatePinnedToCore([](void* arg) {
         AudioService* audio_service = (AudioService*)arg;
         audio_service->AudioOutputTask();
         vTaskDelete(NULL);
-    }, "audio_output", 2048 * 2, this, 4, &audio_output_task_handle_);
+    }, "audio_output", 2048 * 2, this, 7, &audio_output_task_handle_, 1);
 #else
     /* Start the audio input task */
     xTaskCreate([](void* arg) {
@@ -187,12 +188,12 @@ void AudioService::Start() {
     }, "audio_output", 2048, this, 4, &audio_output_task_handle_);
 #endif
 
-    /* Start the opus codec task */
-    xTaskCreate([](void* arg) {
+    /* Start the opus codec task on core 1 (away from WiFi); prio 6 for MP3 decode throughput */
+    xTaskCreatePinnedToCore([](void* arg) {
         AudioService* audio_service = (AudioService*)arg;
         audio_service->OpusCodecTask();
         vTaskDelete(NULL);
-    }, "opus_codec", 2048 * 12, this, 2, &opus_codec_task_handle_);
+    }, "opus_codec", 2048 * 12, this, 6, &opus_codec_task_handle_, 1);
 }
 
 void AudioService::Stop() {
@@ -207,6 +208,13 @@ void AudioService::Stop() {
     audio_decode_queue_.clear();
     audio_playback_queue_.clear();
     audio_testing_queue_.clear();
+#if CONFIG_LINGXIN_SDK_ENABLE
+    playback_pending_pcm_.clear();
+    playback_prebuffer_ready_ = false;
+    lingxin_downlink_ended_ = false;
+    lingxin_downlink_active_ = false;
+    lingxin_downlink_ready_notified_ = false;
+#endif
     audio_queue_cv_.notify_all();
 }
 
@@ -321,13 +329,44 @@ void AudioService::AudioInputTask() {
     ESP_LOGW(TAG, "Audio input task stopped");
 }
 
+#if CONFIG_LINGXIN_SDK_ENABLE
+extern "C" void lingxin_notify_downlink_playback_ready(void);
+#endif
+
 void AudioService::AudioOutputTask() {
     while (true) {
         std::unique_lock<std::mutex> lock(audio_queue_mutex_);
+#if CONFIG_LINGXIN_SDK_ENABLE
+        audio_queue_cv_.wait(lock, [this]() {
+            if (service_stopped_) {
+                return true;
+            }
+            if (audio_playback_queue_.empty()) {
+                return false;
+            }
+            if (!playback_prebuffer_ready_) {
+                if (GetBufferedPlaybackFrameCount() >= LINGXIN_PLAYBACK_PREBUFFER_FRAMES ||
+                    lingxin_downlink_ended_) {
+                    playback_prebuffer_ready_ = true;
+                }
+            }
+            return playback_prebuffer_ready_;
+        });
+#else
         audio_queue_cv_.wait(lock, [this]() { return !audio_playback_queue_.empty() || service_stopped_; });
+#endif
         if (service_stopped_) {
             break;
         }
+
+#if CONFIG_LINGXIN_SDK_ENABLE
+        if (playback_prebuffer_ready_ && lingxin_downlink_active_ && !lingxin_downlink_ready_notified_) {
+            lingxin_downlink_ready_notified_ = true;
+            lock.unlock();
+            lingxin_notify_downlink_playback_ready();
+            lock.lock();
+        }
+#endif
 
         auto task = std::move(audio_playback_queue_.front());
         audio_playback_queue_.pop_front();
@@ -367,13 +406,40 @@ void AudioService::OpusCodecTask() {
         std::unique_lock<std::mutex> lock(audio_queue_mutex_);
         audio_queue_cv_.wait(lock, [this]() {
             return service_stopped_ ||
-                (!audio_encode_queue_.empty() && audio_send_queue_.size() < MAX_SEND_PACKETS_IN_QUEUE) ||
+                (!audio_encode_queue_.empty() && audio_send_queue_.size() < MAX_SEND_PACKETS_IN_QUEUE
+#if CONFIG_LINGXIN_SDK_ENABLE
+                 && (!lingxin_downlink_active_ || lingxin_downlink_ended_)
+#endif
+                ) ||
+#if CONFIG_LINGXIN_SDK_ENABLE
+                (!playback_pending_pcm_.empty() &&
+                 GetBufferedPlaybackFrameCount() < MAX_PLAYBACK_TASKS_IN_QUEUE) ||
+                (!audio_decode_queue_.empty() &&
+                 GetBufferedPlaybackFrameCount() < MAX_PLAYBACK_TASKS_IN_QUEUE);
+#else
                 (!audio_decode_queue_.empty() && audio_playback_queue_.size() < MAX_PLAYBACK_TASKS_IN_QUEUE);
+#endif
         });
         if (service_stopped_) {
             break;
         }
 
+#if CONFIG_LINGXIN_SDK_ENABLE
+        if (!playback_pending_pcm_.empty() &&
+            GetBufferedPlaybackFrameCount() < MAX_PLAYBACK_TASKS_IN_QUEUE) {
+            FlushPendingPlaybackFrames(0);
+        }
+
+        int burst = 0;
+        while (burst < LINGXIN_DECODE_BURST_MAX &&
+               !audio_decode_queue_.empty() &&
+               GetBufferedPlaybackFrameCount() < MAX_PLAYBACK_TASKS_IN_QUEUE - 1) {
+            if (!TryDecodeOneDownlinkPacket(lock)) {
+                break;
+            }
+            burst++;
+        }
+#else
         /* Decode the audio from decode queue */
         if (!audio_decode_queue_.empty() && audio_playback_queue_.size() < MAX_PLAYBACK_TASKS_IN_QUEUE) {
             auto packet = std::move(audio_decode_queue_.front());
@@ -385,16 +451,6 @@ void AudioService::OpusCodecTask() {
             task->type = kAudioTaskTypeDecodeToPlaybackQueue;
             task->timestamp = packet->timestamp;
 
-#if CONFIG_LINGXIN_SDK_ENABLE
-            if (DecodePacketToPcm(*packet, *task)) {
-                lock.lock();
-                audio_playback_queue_.push_back(std::move(task));
-                audio_queue_cv_.notify_all();
-                debug_statistics_.decode_count++;
-            } else {
-                lock.lock();
-            }
-#else
             SetDecodeSampleRate(packet->sample_rate, packet->frame_duration);
             if (opus_decoder_ != nullptr) {
                 task->pcm.resize(decoder_frame_size_);
@@ -433,10 +489,14 @@ void AudioService::OpusCodecTask() {
                 lock.lock();
             }
             debug_statistics_.decode_count++;
-#endif
         }
+#endif
         /* Encode the audio to send queue */
-        if (!audio_encode_queue_.empty() && audio_send_queue_.size() < MAX_SEND_PACKETS_IN_QUEUE) {
+        if (!audio_encode_queue_.empty() && audio_send_queue_.size() < MAX_SEND_PACKETS_IN_QUEUE
+#if CONFIG_LINGXIN_SDK_ENABLE
+            && (!lingxin_downlink_active_ || lingxin_downlink_ended_)
+#endif
+        ) {
             auto task = std::move(audio_encode_queue_.front());
             audio_encode_queue_.pop_front();
             audio_queue_cv_.notify_all();
@@ -550,7 +610,7 @@ bool AudioService::ResamplePlaybackTask(AudioTask& task, int sample_rate, int ch
     return true;
 }
 
-void AudioService::PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t>&& pcm) {
+bool AudioService::PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t>&& pcm, bool wait_if_full) {
     auto task = std::make_unique<AudioTask>();
     task->type = type;
     task->pcm = std::move(pcm);
@@ -567,9 +627,21 @@ void AudioService::PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t
         timestamp_queue_.pop_front();
     }
 
-    audio_queue_cv_.wait(lock, [this]() { return audio_encode_queue_.size() < MAX_ENCODE_TASKS_IN_QUEUE; });
+    if (wait_if_full) {
+        audio_queue_cv_.wait(lock, [this]() { return audio_encode_queue_.size() < MAX_ENCODE_TASKS_IN_QUEUE; });
+    } else if (audio_encode_queue_.size() >= MAX_ENCODE_TASKS_IN_QUEUE) {
+        static int64_t last_drop_log_us = 0;
+        int64_t now_us = esp_timer_get_time();
+        if (now_us - last_drop_log_us > 1000 * 1000) {
+            last_drop_log_us = now_us;
+            ESP_LOGW(TAG, "Encode queue is full, dropping uplink frame to protect AFE fetch");
+        }
+        return false;
+    }
+
     audio_encode_queue_.push_back(std::move(task));
     audio_queue_cv_.notify_all();
+    return true;
 }
 
 bool AudioService::PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> packet, bool wait) {
@@ -755,7 +827,12 @@ bool AudioService::HasPlaybackAudio() const {
 
 bool AudioService::IsIdle() {
     std::lock_guard<std::mutex> lock(audio_queue_mutex_);
-    return audio_encode_queue_.empty() && audio_decode_queue_.empty() && audio_playback_queue_.empty() && audio_testing_queue_.empty();
+    return audio_encode_queue_.empty() && audio_decode_queue_.empty() && audio_playback_queue_.empty() &&
+           audio_testing_queue_.empty()
+#if CONFIG_LINGXIN_SDK_ENABLE
+           && playback_pending_pcm_.empty()
+#endif
+           ;
 }
 
 bool AudioService::IsPlaybackBusy() {
@@ -764,9 +841,22 @@ bool AudioService::IsPlaybackBusy() {
 
 void AudioService::WaitForPlaybackQueueEmpty() {
     std::unique_lock<std::mutex> lock(audio_queue_mutex_);
-    audio_queue_cv_.wait(lock, [this]() { 
-        return service_stopped_ || (audio_decode_queue_.empty() && audio_playback_queue_.empty()); 
-    });
+    while (!service_stopped_) {
+        FlushPendingPlaybackFrames(0);
+#if CONFIG_LINGXIN_SDK_ENABLE
+        if (audio_decode_queue_.empty() && !playback_pending_pcm_.empty()) {
+            FlushPendingPlaybackFrames(0, true);
+        }
+#endif
+        if (audio_decode_queue_.empty() && audio_playback_queue_.empty()
+#if CONFIG_LINGXIN_SDK_ENABLE
+            && playback_pending_pcm_.empty()
+#endif
+        ) {
+            break;
+        }
+        audio_queue_cv_.wait_for(lock, std::chrono::milliseconds(20));
+    }
 }
 
 void AudioService::ResetDecoder() {
@@ -783,6 +873,13 @@ void AudioService::ResetDecoder() {
     audio_decode_queue_.clear();
     audio_playback_queue_.clear();
     audio_testing_queue_.clear();
+#if CONFIG_LINGXIN_SDK_ENABLE
+    playback_pending_pcm_.clear();
+    playback_prebuffer_ready_ = false;
+    lingxin_downlink_ended_ = false;
+    lingxin_downlink_active_ = false;
+    lingxin_downlink_ready_notified_ = false;
+#endif
     audio_queue_cv_.notify_all();
 }
 
@@ -841,6 +938,100 @@ bool AudioService::IsAfeWakeWord() {
 }
 
 #if CONFIG_LINGXIN_SDK_ENABLE
+
+size_t AudioService::GetPlaybackFrameSamples() const {
+    return static_cast<size_t>(codec_->output_sample_rate() / 1000 * LINGXIN_PLAYBACK_FRAME_MS);
+}
+
+size_t AudioService::GetBufferedPlaybackFrameCount() const {
+    const size_t frame_samples = GetPlaybackFrameSamples();
+    if (frame_samples == 0) {
+        return audio_playback_queue_.size();
+    }
+    return audio_playback_queue_.size() + playback_pending_pcm_.size() / frame_samples;
+}
+
+bool AudioService::TryDecodeOneDownlinkPacket(std::unique_lock<std::mutex>& lock) {
+    if (audio_decode_queue_.empty()) {
+        return false;
+    }
+    if (GetBufferedPlaybackFrameCount() >= MAX_PLAYBACK_TASKS_IN_QUEUE) {
+        return false;
+    }
+
+    auto packet = std::move(audio_decode_queue_.front());
+    audio_decode_queue_.pop_front();
+    audio_queue_cv_.notify_all();
+    lock.unlock();
+
+    auto task = std::make_unique<AudioTask>();
+    task->type = kAudioTaskTypeDecodeToPlaybackQueue;
+    task->timestamp = packet->timestamp;
+    bool decoded = DecodePacketToPcm(*packet, *task);
+
+    lock.lock();
+    if (decoded) {
+        EnqueuePlaybackPcm(std::move(task->pcm), task->timestamp);
+    }
+    return decoded;
+}
+
+void AudioService::BeginDownlinkPlayback() {
+    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    playback_prebuffer_ready_ = false;
+    lingxin_downlink_ended_ = false;
+    lingxin_downlink_active_ = true;
+    lingxin_downlink_ready_notified_ = false;
+}
+
+void AudioService::FlushPendingPlaybackFrames(uint32_t timestamp, bool flush_partial) {
+    const size_t frame_samples = GetPlaybackFrameSamples();
+    if (frame_samples == 0) {
+        return;
+    }
+
+    while (playback_pending_pcm_.size() >= frame_samples &&
+           audio_playback_queue_.size() < MAX_PLAYBACK_TASKS_IN_QUEUE) {
+        auto frame_task = std::make_unique<AudioTask>();
+        frame_task->type = kAudioTaskTypeDecodeToPlaybackQueue;
+        frame_task->timestamp = timestamp;
+        frame_task->pcm.assign(playback_pending_pcm_.begin(),
+                               playback_pending_pcm_.begin() + frame_samples);
+        playback_pending_pcm_.erase(playback_pending_pcm_.begin(),
+                                    playback_pending_pcm_.begin() + frame_samples);
+        audio_playback_queue_.push_back(std::move(frame_task));
+        debug_statistics_.decode_count++;
+    }
+
+    /* Zero-pad and play the tail frame so playback does not truncate or block waiters. */
+    if (flush_partial && !playback_pending_pcm_.empty() &&
+        audio_playback_queue_.size() < MAX_PLAYBACK_TASKS_IN_QUEUE) {
+        auto frame_task = std::make_unique<AudioTask>();
+        frame_task->type = kAudioTaskTypeDecodeToPlaybackQueue;
+        frame_task->timestamp = timestamp;
+        frame_task->pcm = std::move(playback_pending_pcm_);
+        frame_task->pcm.resize(frame_samples, 0);
+        playback_pending_pcm_.clear();
+        audio_playback_queue_.push_back(std::move(frame_task));
+        debug_statistics_.decode_count++;
+    }
+
+    audio_queue_cv_.notify_all();
+}
+
+void AudioService::EnqueuePlaybackPcm(std::vector<int16_t>&& pcm, uint32_t timestamp) {
+    if (!pcm.empty()) {
+        playback_pending_pcm_.insert(playback_pending_pcm_.end(), pcm.begin(), pcm.end());
+    }
+    FlushPendingPlaybackFrames(timestamp);
+}
+
+void AudioService::FlushPlaybackPending() {
+    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    lingxin_downlink_ended_ = true;
+    playback_prebuffer_ready_ = true;
+    FlushPendingPlaybackFrames(0, true);
+}
 
 bool AudioService::DecodePacketToPcm(const AudioStreamPacket& packet, AudioTask& task) {
     if (!audio_decoder_) {

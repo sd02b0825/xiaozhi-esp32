@@ -87,6 +87,19 @@ void audio_service_push_decode_packet(const uint8_t *data, int len, const char *
  */
 void audio_service_reset_decoder(void);
 
+void audio_service_begin_downlink_playback(void);
+
+/**
+ * Flush any partial PCM frame left after downlink stream ends.
+ * Called by module_bufferPlay_audioEnd().
+ */
+void audio_service_flush_playback_pending(void);
+
+/**
+ * Called when downlink prebuffer is ready; triggers speaking state transition.
+ */
+void lingxin_notify_downlink_playback_ready(void);
+
 /**
  * Set the processor task priority (used by SDK uplink).
  */
@@ -100,6 +113,46 @@ void audio_service_set_processor_task_priority(int priority);
  * audio_path: filesystem path to audio file
  */
 void audio_service_play_local_sound(const char *audio_path);
+
+/**
+ * Set speaker output volume (0-100) and persist to NVS.
+ * Called by LingXin SDK set_volume() adapter path.
+ */
+void audio_service_set_output_volume(int volume);
+
+/**
+ * Record that a volume system instruction was executed locally this turn.
+ * Does not suppress TTS until a conflicting agent_response_text is seen.
+ */
+void lingxin_mark_volume_command_handled(int target_volume);
+
+/** Return 1 if a volume command was handled in the current dialogue turn. */
+int lingxin_volume_command_handled_this_turn(void);
+
+/** Enable/disable dropping cloud TTS packets for the rest of this turn. */
+void lingxin_set_suppress_cloud_tts(int suppress);
+
+/** Return 1 if cloud downlink TTS should be suppressed for this turn. */
+int lingxin_should_suppress_cloud_tts(void);
+
+/** Last target volume from a locally handled command, or -1. */
+int lingxin_get_last_volume_command_target(void);
+
+/** Clear suppress flag after downlink stream ends. */
+void lingxin_clear_volume_command_suppress(void);
+
+/** Mark that device should enter standby after current downlink TTS finishes. */
+void lingxin_mark_standby_after_playback(void);
+
+/** Return 1 if standby was requested for after current playback. */
+int lingxin_standby_after_playback_pending(void);
+
+void lingxin_clear_standby_after_playback(void);
+
+/** Block AbortSpeaking/Wakeup_Detected while gracefully exiting to standby. */
+void lingxin_set_standby_exit_in_progress(int in_progress);
+
+int lingxin_standby_exit_in_progress(void);
 
 /* ---- Device info bridge ---- */
 

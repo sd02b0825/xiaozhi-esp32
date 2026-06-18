@@ -40,7 +40,15 @@
 
 #define OPUS_FRAME_DURATION_MS 60
 #define MAX_ENCODE_TASKS_IN_QUEUE 2
+#if CONFIG_LINGXIN_SDK_ENABLE
+/* Lingxin MP3 downlink: 20ms PCM frames + deeper queue for jitter absorption. */
+#define LINGXIN_PLAYBACK_FRAME_MS 20
+#define LINGXIN_PLAYBACK_PREBUFFER_FRAMES 25
+#define LINGXIN_DECODE_BURST_MAX 8
+#define MAX_PLAYBACK_TASKS_IN_QUEUE 64
+#else
 #define MAX_PLAYBACK_TASKS_IN_QUEUE 6
+#endif
 #define MAX_DECODE_PACKETS_IN_QUEUE (2400 / OPUS_FRAME_DURATION_MS)
 #define MAX_SEND_PACKETS_IN_QUEUE (2400 / OPUS_FRAME_DURATION_MS)
 #define AUDIO_TESTING_MAX_DURATION_MS 10000
@@ -150,6 +158,10 @@ public:
     bool ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples);
     void ResetDecoder();
     void SetModelsList(srmodel_list_t* models_list);
+#if CONFIG_LINGXIN_SDK_ENABLE
+    void FlushPlaybackPending();
+    void BeginDownlinkPlayback();
+#endif
 #if CONFIG_USE_AUDIO_PROCESSOR
     void SetProcessorTaskPriority(UBaseType_t priority);
 #endif
@@ -212,11 +224,23 @@ private:
     void AudioInputTask();
     void AudioOutputTask();
     void OpusCodecTask();
-    void PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t>&& pcm);
+    bool PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t>&& pcm, bool wait_if_full = true);
     bool DecodePacketToPcm(const AudioStreamPacket& packet, AudioTask& task);
     void SetDecodeSampleRate(int sample_rate, int frame_duration);
     bool ResamplePlaybackTask(AudioTask& task, int sample_rate, int channels);
     void CheckAndUpdateAudioPowerState();
+#if CONFIG_LINGXIN_SDK_ENABLE
+    size_t GetPlaybackFrameSamples() const;
+    size_t GetBufferedPlaybackFrameCount() const;
+    bool TryDecodeOneDownlinkPacket(std::unique_lock<std::mutex>& lock);
+    void EnqueuePlaybackPcm(std::vector<int16_t>&& pcm, uint32_t timestamp);
+    void FlushPendingPlaybackFrames(uint32_t timestamp, bool flush_partial = false);
+    std::vector<int16_t> playback_pending_pcm_;
+    bool playback_prebuffer_ready_ = false;
+    bool lingxin_downlink_ended_ = false;
+    bool lingxin_downlink_active_ = false;
+    bool lingxin_downlink_ready_notified_ = false;
+#endif
 
     
 };

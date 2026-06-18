@@ -63,11 +63,10 @@ bool AudioDecoder::DecodeMp3(const uint8_t *data, size_t len, std::vector<int16_
     }
 
     int max_out_size = 4096;
-    uint8_t *out_buf = static_cast<uint8_t *>(malloc(max_out_size));
-    if (out_buf == nullptr) {
-        ESP_LOGE(TAG, "Failed to allocate MP3 decode output buffer");
-        return false;
+    if (mp3_decode_buf_.size() < static_cast<size_t>(max_out_size)) {
+        mp3_decode_buf_.resize(max_out_size);
     }
+    uint8_t *out_buf = mp3_decode_buf_.data();
 
     esp_audio_simple_dec_raw_t raw = {};
     raw.buffer = const_cast<uint8_t *>(data);
@@ -99,17 +98,9 @@ bool AudioDecoder::DecodeMp3(const uint8_t *data, size_t len, std::vector<int16_
                 ESP_LOGE(TAG, "MP3 decode exceeded max reallocs (%d), aborting", kMaxReallocs);
                 break;
             }
-            uint8_t *new_buf = static_cast<uint8_t *>(realloc(out_buf, out_frame.needed_size));
-            if (new_buf == nullptr) {
-                ESP_LOGE(TAG, "Failed to realloc MP3 output buffer to %d", out_frame.needed_size);
-    if (out_buf != nullptr) {
-        free(out_buf);
-    }
-                out_buf = nullptr;
-                break;
-            }
-            out_buf = new_buf;
-            max_out_size = out_frame.needed_size;
+            max_out_size = static_cast<int>(out_frame.needed_size);
+            mp3_decode_buf_.resize(max_out_size);
+            out_buf = mp3_decode_buf_.data();
             continue;
         }
 
@@ -152,8 +143,6 @@ bool AudioDecoder::DecodeMp3(const uint8_t *data, size_t len, std::vector<int16_
         raw.buffer += raw.consumed;
         raw.len -= raw.consumed;
     }
-
-    free(out_buf);
 
     if (all_pcm.empty()) {
         return false;
