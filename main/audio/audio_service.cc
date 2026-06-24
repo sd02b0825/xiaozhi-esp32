@@ -345,7 +345,9 @@ void AudioService::AudioOutputTask() {
                 return false;
             }
             if (!playback_prebuffer_ready_) {
-                if (GetBufferedPlaybackFrameCount() >= LINGXIN_PLAYBACK_PREBUFFER_FRAMES ||
+                /* 云端下行需预缓冲；本地 PlaySound（提醒音等）在 idle 时直接播放 */
+                if (!lingxin_downlink_active_ ||
+                    GetBufferedPlaybackFrameCount() >= LINGXIN_PLAYBACK_PREBUFFER_FRAMES ||
                     lingxin_downlink_ended_) {
                     playback_prebuffer_ready_ = true;
                 }
@@ -438,6 +440,13 @@ void AudioService::OpusCodecTask() {
                 break;
             }
             burst++;
+        }
+
+        /* 本地 OGG 提示音短于预缓冲阈值，解码完成后立即刷出尾帧 */
+        if (!lingxin_downlink_active_ && audio_decode_queue_.empty() &&
+            !playback_pending_pcm_.empty()) {
+            FlushPendingPlaybackFrames(0, true);
+            playback_prebuffer_ready_ = true;
         }
 #else
         /* Decode the audio from decode queue */

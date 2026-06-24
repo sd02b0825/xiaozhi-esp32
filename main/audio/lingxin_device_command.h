@@ -1,8 +1,8 @@
 /**
  * lingxin_device_command.h - LingXin cloud system instruction handler
  *
- * Parses volume control commands (INCREASE_VOLUME_BY, MUTE, etc.) and standby
- * commands (STANDBY) from WebSocket JSON payloads and applies them locally.
+ * Parses volume control commands (INCREASE_VOLUME_BY, MUTE, etc.), standby
+ * commands (STANDBY), and alarm commands (SET_ALARM) from WebSocket JSON payloads.
  */
 
 #ifndef LINGXIN_DEVICE_COMMAND_H

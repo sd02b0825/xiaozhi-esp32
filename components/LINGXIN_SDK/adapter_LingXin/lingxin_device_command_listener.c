@@ -3,7 +3,10 @@
  */
 
 #include "lingxin_device_command_listener.h"
+#include "lingxin_alarm_trigger.h"
 #include "lingxin_protocol_manager.h"
+#include "chat_state_machine.h"
+#include "chat_state_machine_event.h"
 #include "lingxin_log.h"
 #include "lingxin_memory.h"
 #include <stdbool.h>
@@ -46,4 +49,26 @@ void lingxin_adapter_init_device_command_listener(void)
     } else {
         lingxin_log_error("Failed to register device command listener");
     }
+}
+
+void lingxin_trigger_schedule_alarm(const char *schedule_task_id)
+{
+    if (schedule_task_id == NULL || schedule_task_id[0] == '\0') {
+        return;
+    }
+
+    char *task_id_copy = lingxin_strdup(schedule_task_id);
+    if (task_id_copy == NULL) {
+        lingxin_log_error("lingxin_trigger_schedule_alarm: strdup failed");
+        return;
+    }
+
+    ScheduleTimerPayload schedule_payload = {0};
+    schedule_payload.schedule_task_id = task_id_copy;
+    schedule_payload.input_mode = "no_voice";
+    StateEventPayload payload = {
+        .schedule_timer_payload = &schedule_payload,
+    };
+    state_machine_run_event_with_payload(State_Event_NoVoice_Start, &payload);
+    lingxin_free(task_id_copy);
 }

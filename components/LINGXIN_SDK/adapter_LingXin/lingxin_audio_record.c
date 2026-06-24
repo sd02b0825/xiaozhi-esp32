@@ -60,6 +60,7 @@ static void feed_pcm_in_frames(recorder_hdl *hdl, const uint8_t *data, size_t le
         if (hdl->pending_len == (size_t)fs) {
             lingxin_process_record_data(hdl->pending_buf, fs);
             hdl->pending_len = 0;
+            taskYIELD();
         }
     }
 
@@ -67,6 +68,7 @@ static void feed_pcm_in_frames(recorder_hdl *hdl, const uint8_t *data, size_t le
         lingxin_process_record_data(src, fs);
         src += fs;
         src_len -= fs;
+        taskYIELD();
     }
 
     if (src_len > 0) {
@@ -125,12 +127,16 @@ static void audio_processing_task(void *arg)
 
     lingxin_log_debug("audio_processing_task started, frame_size=%d", hdl->frame_size);
 
-    /* 每轮最多处理 8KB 后让出 CPU，避免 ringbuf 积压时饿死 IDLE 触发 WDT */
-    const size_t kYieldBatchBytes = 8192;
+    /* 每轮最多处理 2 帧（约 40ms PCM）后强制让出 CPU，避免饿死 IDLE 触发 WDT */
+    const size_t kYieldBatchBytes = (hdl->frame_size > 0) ? (size_t)hdl->frame_size * 2 : 1280;
+    const TickType_t kIdleWaitTicks = pdMS_TO_TICKS(10) > 0 ? pdMS_TO_TICKS(10) : 1;
 
     while (hdl && !hdl->should_stop) {
         size_t processed = 0;
-        while (processed < kYieldBatchBytes) {
+        while (processed < kYieldBatchBytes && !hdl->should_stop) {
+            if (hdl->ringbuf == NULL) {
+                break;
+            }
             size_t actual_size = 0;
             void *item = xRingbufferReceive(hdl->ringbuf, &actual_size, 0);
             if (item == NULL || actual_size == 0) {
@@ -140,7 +146,8 @@ static void audio_processing_task(void *arg)
             vRingbufferReturnItem(hdl->ringbuf, item);
             processed += actual_size;
         }
-        vTaskDelay(pdMS_TO_TICKS(1));
+        /* 至少让出 1 个 tick，pdMS_TO_TICKS(1) 在 100Hz 下可能为 0 */
+        vTaskDelay(kIdleWaitTicks);
     }
 
     lingxin_log_debug("audio_processing_task exiting");
@@ -208,7 +215,7 @@ void lingxin_recorder_finish_open(void *recorder)
     snprintf(task_name, sizeof(task_name), "lx_r_%ld", now_time);
     lingxin_log_debug("create audio processing task: %s", task_name);
 
-    BaseType_t task_ret = xTaskCreatePinnedToCore(audio_processing_task, task_name, 4096, hdl, 8, NULL, 1);
+    BaseType_t task_ret = xTaskCreatePinnedToCore(audio_processing_task, task_name, 4096, hdl, 3, NULL, 0);
     if (task_ret != pdPASS) {
         lingxin_log_error("Failed to create audio processing task");
         g_record_ringbuf = NULL;
@@ -287,8 +294,9 @@ void lingxin_recorder_close(lingxin_recorder_t recorder, lingxin_recorder_callba
         lingxin_log_debug("lingxin_recorder_close set should_stop");
         hdl->should_stop = true;
         if (hdl->task_done_sem) {
-            lingxin_semaphore_pend(hdl->task_done_sem, 200);
-            lingxin_log_debug("audio_processing_task exited");
+            /* 等待消费任务退出，避免 Vad_Exit 切状态时 ringbuf 仍被访问 */
+            lingxin_semaphore_pend(hdl->task_done_sem, 1000);
+            lingxin_log_debug("audio_processing_task exited or timeout");
         }
     }
 

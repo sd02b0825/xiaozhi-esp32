@@ -154,6 +154,19 @@ void lingxin_set_standby_exit_in_progress(int in_progress);
 
 int lingxin_standby_exit_in_progress(void);
 
+/**
+ * 本地闹钟到点后请求云端 TTS 播报。
+ * @param message 提醒内容，如「喝水」
+ * @param schedule_task_id 云端 schedule_task_id（可选，优先使用）
+ */
+void lingxin_request_alarm_cloud_tts(const char *message, const char *schedule_task_id);
+
+/** 标记当前为本地闹钟到点播报轮次（此轮内忽略云端误下发的 SET_ALARM） */
+void lingxin_set_alarm_alert_turn(int active);
+
+/** 是否处于本地闹钟到点播报轮次 */
+int lingxin_is_alarm_alert_turn(void);
+
 /* ---- Device info bridge ---- */
 
 /**

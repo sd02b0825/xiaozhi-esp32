@@ -39,6 +39,7 @@ static std::atomic<bool> g_suppress_cloud_tts_after_volume{false};
 static std::atomic<int> g_last_volume_command_target{-1};
 static std::atomic<bool> g_standby_after_playback{false};
 static std::atomic<bool> g_standby_exit_in_progress{false};
+static std::atomic<bool> g_alarm_alert_turn{false};
 
 extern "C" void lingxin_recorder_finish_open(void *recorder_hdl);
 
@@ -83,6 +84,10 @@ int audio_service_is_playback_busy(void)
 void audio_service_schedule_recorder_uplink_begin(void *recorder_hdl)
 {
     if (recorder_hdl == nullptr) {
+        return;
+    }
+    if (lingxin_is_alarm_alert_turn()) {
+        ESP_LOGI(TAG, "Skip recorder uplink during alarm alert turn");
         return;
     }
 
@@ -277,6 +282,32 @@ void lingxin_set_standby_exit_in_progress(int in_progress)
 int lingxin_standby_exit_in_progress(void)
 {
     return g_standby_exit_in_progress.load() ? 1 : 0;
+}
+
+void lingxin_request_alarm_cloud_tts(const char *message, const char *schedule_task_id)
+{
+#if CONFIG_LINGXIN_SDK_ENABLE
+    auto *protocol = LingxinSdkProtocol::GetInstance();
+    if (protocol == nullptr || !protocol->IsInitialized()) {
+        ESP_LOGW(TAG, "Alarm cloud TTS skipped: LingXin SDK not ready");
+        return;
+    }
+    g_alarm_alert_turn.store(true);
+    protocol->RequestAlarmCloudTts(message != nullptr ? message : "", schedule_task_id);
+#else
+    (void)message;
+    (void)schedule_task_id;
+#endif
+}
+
+void lingxin_set_alarm_alert_turn(int active)
+{
+    g_alarm_alert_turn.store(active != 0);
+}
+
+int lingxin_is_alarm_alert_turn(void)
+{
+    return g_alarm_alert_turn.load() ? 1 : 0;
 }
 
 /* ---- Device info bridge ---- */

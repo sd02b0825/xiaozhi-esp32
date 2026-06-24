@@ -34,6 +34,9 @@ public:
     /** Called from bridge when first downlink packet is queued. */
     void OnDownlinkStarted();
 
+    /** 本地闹钟到点后请求云端 TTS 播报提醒内容 */
+    void RequestAlarmCloudTts(const std::string& message, const char* schedule_task_id = nullptr);
+
 private:
     bool SendText(const std::string& text) override;
 
@@ -43,6 +46,7 @@ private:
     bool pending_outputing_ = false;
     std::string current_wake_word_;
     std::string mcp_message_buffer_;
+    std::string alarm_tts_input_buffer_;
     std::string chat_mode_;
     std::string flow_control_strategy_;
     int flow_control_max_size_ = 32;

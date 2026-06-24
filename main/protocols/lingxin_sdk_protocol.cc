@@ -17,6 +17,7 @@
 #include "settings.h"
 extern "C" {
 #include "chat_state_machine_event.h"
+#include "lingxin_alarm_trigger.h"
 #include "audio_buffer_play.h"
 }
 #include "display.h"
@@ -226,6 +227,10 @@ void LingxinSdkProtocol::ApplyChatPhase(ChatPhaseCode phase) {
         pending_outputing_ = false;
         if (on_audio_channel_opened_) {
             on_audio_channel_opened_();
+        }
+        if (lingxin_is_alarm_alert_turn()) {
+            ESP_LOGI(TAG, "Skip listening state during alarm alert turn");
+            break;
         }
         if (chat_session_active_ && state != kDeviceStateActivating &&
             state != kDeviceStateWifiConfiguring && state != kDeviceStateAudioTesting) {
@@ -438,6 +443,7 @@ void LingxinSdkProtocol::HandleTextOut(char *text) {
 void LingxinSdkProtocol::HandleExit(ExitCode exit_code, char *reason) {
     ESP_LOGI(TAG, "HandleExit: code=%d, reason=%s", exit_code, reason ? reason : "null");
     pending_outputing_ = false;
+    lingxin_set_alarm_alert_turn(0);
     bool notify_close = chat_session_active_ || audio_channel_opened_;
     ClearChatSessionFlags();
     if (notify_close && on_audio_channel_closed_) {
@@ -450,7 +456,9 @@ void LingxinSdkProtocol::HandlePlayEnd() {
     ESP_LOGI(TAG, "HandlePlayEnd");
     pending_outputing_ = false;
     const bool standby_after_playback = lingxin_standby_after_playback_pending() != 0;
+    const bool alarm_alert_turn = lingxin_is_alarm_alert_turn() != 0;
     lingxin_clear_volume_command_suppress();
+    lingxin_set_alarm_alert_turn(0);
     auto& app = Application::GetInstance();
     app.GetAudioService().WaitForPlaybackQueueEmpty();
     if (audio_service_is_sdk_uplink_active()) {
@@ -468,6 +476,16 @@ void LingxinSdkProtocol::HandlePlayEnd() {
         }
         return;
     }
+    if (alarm_alert_turn) {
+        ESP_LOGI(TAG, "Alarm alert playback finished, return to idle");
+        if (IsAudioChannelOpened()) {
+            CloseAudioChannel();
+        } else if (app.GetDeviceState() == kDeviceStateSpeaking ||
+                   app.GetDeviceState() == kDeviceStateListening) {
+            app.SetDeviceState(kDeviceStateIdle);
+        }
+        return;
+    }
     if (app.GetDeviceState() == kDeviceStateSpeaking) {
         app.SetDeviceState(kDeviceStateListening);
     }
@@ -475,6 +493,7 @@ void LingxinSdkProtocol::HandlePlayEnd() {
 
 void LingxinSdkProtocol::HandleError() {
     ESP_LOGE(TAG, "HandleError");
+    lingxin_set_alarm_alert_turn(0);
     if (on_network_error_) {
         on_network_error_("SDK internal error");
     }
@@ -514,7 +533,7 @@ bool LingxinSdkProtocol::Start() {
     props.welcome_audio_path = NULL;
     props.terminate_audio_path = NULL;
     props.continue_audio_path = NULL;
-    props.is_schedule_task_on = 0;
+    props.is_schedule_task_on = 1;
     props.is_log_upload_on = 0;
 
     int ret = voice_chat_init(&props);
@@ -652,6 +671,39 @@ void LingxinSdkProtocol::SendMcpMessage(const std::string& message) {
 bool LingxinSdkProtocol::SendText(const std::string& text) {
     (void)text;
     return true;
+}
+
+void LingxinSdkProtocol::RequestAlarmCloudTts(const std::string& message, const char* schedule_task_id) {
+    if (!sdk_initialized_) {
+        ESP_LOGW(TAG, "RequestAlarmCloudTts: SDK not initialized");
+        return;
+    }
+
+    if (schedule_task_id != nullptr && schedule_task_id[0] != '\0') {
+        ESP_LOGI(TAG, "RequestAlarmCloudTts via schedule_task_id: %s", schedule_task_id);
+        lingxin_trigger_schedule_alarm(schedule_task_id);
+        chat_session_active_ = true;
+        return;
+    }
+
+    const std::string content = message.empty() ? "提醒时间到了" : message;
+    alarm_tts_input_buffer_ = content;
+
+    StartNewChatProps start_props = get_start_new_chat_default_props();
+    start_props.disable_welcome_audio = true;
+    start_props.single_round = true;
+    start_props.play_prologue = false;
+    start_props.user_input = alarm_tts_input_buffer_.data();
+    ApplyStartNewChatProps(start_props);
+
+    ESP_LOGI(TAG, "RequestAlarmCloudTts via user_input: %s", alarm_tts_input_buffer_.c_str());
+    const int ret = start_new_chat(&start_props);
+    if (ret != 0) {
+        ESP_LOGE(TAG, "RequestAlarmCloudTts start_new_chat failed: %d", ret);
+        lingxin_set_alarm_alert_turn(0);
+        return;
+    }
+    chat_session_active_ = true;
 }
 
 #endif  // CONFIG_LINGXIN_SDK_ENABLE
