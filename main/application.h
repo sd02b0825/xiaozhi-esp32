@@ -19,6 +19,9 @@
 #endif
 #include "device_state.h"
 #include "device_state_machine.h"
+#if CONFIG_LINGXIN_SDK_ENABLE
+#include "lingxin_sdk_protocol.h"
+#endif
 
 // Main event bits
 #define MAIN_EVENT_SCHEDULE             (1 << 0)
@@ -115,6 +118,22 @@ public:
     AecMode GetAecMode() const { return aec_mode_; }
     void PlaySound(const std::string_view& sound);
     AudioService& GetAudioService() { return audio_service_; }
+    bool IsLingxinSdkEnabled() const {
+#if CONFIG_LINGXIN_SDK_ENABLE
+        return true;
+#else
+        return false;
+#endif
+    }
+    bool IsChatModeVoice() const;
+    std::vector<int16_t>& GetVoiceprintFeedPcm() {
+        static std::vector<int16_t> empty;
+#if CONFIG_LINGXIN_SDK_ENABLE
+        return voiceprint_feed_pcm_;
+#else
+        return empty;
+#endif
+    }
     
     /**
      * Reset protocol resources (thread-safe)
@@ -148,6 +167,17 @@ private:
     bool play_popup_on_listening_ = false;  // Flag to play popup sound after state changes to listening
     int clock_ticks_ = 0;
     TaskHandle_t activation_task_handle_ = nullptr;
+
+#if CONFIG_LINGXIN_SDK_ENABLE
+    std::unique_ptr<LingxinSdkProtocol> lingxin_sdk_;
+    bool voiceprint_pending_ = false;
+    bool use_traditional_audio_upload_ = true;
+    std::string chat_mode_;
+    std::vector<int16_t> voiceprint_feed_pcm_;
+
+    void HandleVoiceprintStart();
+    void HandleVoiceprintEnd(const std::string& speaker, const std::string& message);
+#endif
 
 
     // Event handlers

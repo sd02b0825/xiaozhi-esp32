@@ -114,9 +114,9 @@ void AudioService::Initialize(AudioCodec* codec) {
     audio_processor_->OnOutput([this](std::vector<int16_t>&& data) {
 #if CONFIG_LINGXIN_SDK_ENABLE
         if (lingxin_sdk_is_record_mode() && lingxin_record_ringbuf_available()) {
-            if (!lingxin_record_write_pcm(
+            if (lingxin_record_write_pcm(
                     reinterpret_cast<const uint8_t*>(data.data()),
-                    data.size() * sizeof(int16_t))) {
+                    data.size() * sizeof(int16_t)) != 0) {
                 ESP_LOGW(TAG, "Lingxin record ringbuf is full, dropping %u samples",
                          static_cast<unsigned>(data.size()));
             }
@@ -126,6 +126,15 @@ void AudioService::Initialize(AudioCodec* codec) {
             ESP_LOGW(TAG, "Lingxin record mode active but ringbuf unavailable, dropping %u samples",
                      static_cast<unsigned>(data.size()));
             return;
+        }
+        if (voiceprint_buffer_enabled_.load(std::memory_order_relaxed)) {
+            constexpr size_t kMaxVoiceprintSamples = 16000 * 30;  // 30 seconds max
+            std::lock_guard<std::mutex> lock(voiceprint_buffer_mutex_);
+            if (voiceprint_buffer_enabled_.load(std::memory_order_relaxed)) {
+                if (voiceprint_pcm_buffer_.size() + data.size() <= kMaxVoiceprintSamples) {
+                    voiceprint_pcm_buffer_.insert(voiceprint_pcm_buffer_.end(), data.begin(), data.end());
+                }
+            }
         }
 #endif
         PushTaskToEncodeQueue(kAudioTaskTypeEncodeToSendQueue, std::move(data));
@@ -912,6 +921,26 @@ bool AudioService::DecodePacketToPcm(const AudioStreamPacket& packet, AudioTask&
 
     ESP_LOGE(TAG, "Unsupported downlink audio codec: %s", codec.c_str());
     return false;
+}
+
+void AudioService::EnableVoiceprintBuffer(bool enable) {
+    voiceprint_buffer_enabled_.store(enable, std::memory_order_relaxed);
+    if (!enable) {
+        std::lock_guard<std::mutex> lock(voiceprint_buffer_mutex_);
+        voiceprint_pcm_buffer_.clear();
+    }
+}
+
+std::vector<int16_t> AudioService::GetVoiceprintBuffer() {
+    std::lock_guard<std::mutex> lock(voiceprint_buffer_mutex_);
+    std::vector<int16_t> result;
+    result.swap(voiceprint_pcm_buffer_);
+    return result;
+}
+
+void AudioService::ClearVoiceprintBuffer() {
+    std::lock_guard<std::mutex> lock(voiceprint_buffer_mutex_);
+    voiceprint_pcm_buffer_.clear();
 }
 
 #endif  // CONFIG_LINGXIN_SDK_ENABLE

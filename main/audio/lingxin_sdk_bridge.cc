@@ -16,6 +16,8 @@
 #include "boards/common/board.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include <string>
 #include <atomic>
 
@@ -88,20 +90,64 @@ void audio_service_schedule_recorder_uplink_begin(void *recorder_hdl)
         int wait_ms = static_cast<int>((esp_timer_get_time() - t0) / 1000);
         ESP_LOGI(TAG, "recorder uplink: wait_playback %d ms", wait_ms);
 
+        auto &app = Application::GetInstance();
+
+#if CONFIG_LINGXIN_SDK_ENABLE
+        auto *sdk = LingxinSdkProtocol::GetInstance();
+        if (sdk && sdk->IsPaused()) {
+            ESP_LOGI(TAG, "recorder uplink: SDK paused, skipping recorder_finish_open");
+            return;
+        }
+#endif
+
+        if (app.GetDeviceState() != kDeviceStateListening &&
+            app.GetDeviceState() != kDeviceStateConnecting) {
+            app.SetDeviceState(kDeviceStateListening);
+        }
+
+        // Create audio_processing_task which reads from ringbuf.
+        // This must happen BEFORE we feed buffered audio so the ringbuf
+        // has an active consumer and won't overflow.
+        lingxin_recorder_finish_open(recorder_hdl);
+
+#if CONFIG_LINGXIN_SDK_ENABLE
+        // Voiceprint flow has already captured the user's speech before SDK starts.
+        // Feed only that buffered audio, then explicitly end SDK input so the cloud
+        // can leave INPUTING and produce the model response.
+        auto& feed_pcm = app.GetVoiceprintFeedPcm();
+        if (!feed_pcm.empty()) {
+            auto *sdk = LingxinSdkProtocol::GetInstance();
+            g_sdk_uplink_active.store(true);
+            if (sdk) {
+                ESP_LOGI(TAG, "Feeding %u voiceprint buffered samples after recorder ready",
+                         (unsigned)feed_pcm.size());
+                sdk->FeedBufferedAudio(feed_pcm);
+                vTaskDelay(pdMS_TO_TICKS(100));
+                sdk->FinishBufferedAudioInput();
+            } else {
+                ESP_LOGW(TAG, "No Lingxin SDK instance, cannot finish buffered input");
+            }
+            feed_pcm.clear();
+            feed_pcm.shrink_to_fit();
+            return;
+        }
+
+        // Voice mode: audio captured by traditional protocol, fed later via FeedBufferedAudio.
+        // Don't start live SDK recording; recorder task waits for buffered data.
+        if (app.IsChatModeVoice()) {
+            ESP_LOGI(TAG, "Voice mode: skipping live recorder, waiting for buffered audio");
+            return;
+        }
+#endif
+
+        // Normal SDK flow without voiceprint cache: stream live microphone audio.
+        ESP_LOGI(TAG, "No voiceprint buffer, starting live SDK recorder uplink");
         audio_service_start_record_to_sdk();
         g_sdk_uplink_active.store(true);
         audio_service.EnableVoiceProcessing(true);
 #if CONFIG_USE_AUDIO_PROCESSOR
         audio_service_set_processor_task_priority(5);
 #endif
-
-        auto &app = Application::GetInstance();
-        if (app.GetDeviceState() != kDeviceStateListening &&
-            app.GetDeviceState() != kDeviceStateConnecting) {
-            app.SetDeviceState(kDeviceStateListening);
-        }
-
-        lingxin_recorder_finish_open(recorder_hdl);
     });
 }
 

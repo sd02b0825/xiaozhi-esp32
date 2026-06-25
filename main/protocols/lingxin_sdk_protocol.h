@@ -34,6 +34,21 @@ public:
     /** Called from bridge when first downlink packet is queued. */
     void OnDownlinkStarted();
 
+    /** True when SDK internal recorder (upload state) has been reached */
+    bool IsRecorderOpen() const { return audio_channel_opened_; }
+
+    /** True when SDK is paused (exit_chat with keep-WS-alive), waiting for next round */
+    bool IsPaused() const { return chat_paused_; }
+
+    /** Set the speaker name for voiceprint identification result */
+    void SetSpeaker(const std::string& speaker, const std::string& message);
+
+    /** Feed buffered PCM audio into SDK record ring buffer */
+    void FeedBufferedAudio(const std::vector<int16_t>& pcm_data);
+
+    /** Finish the SDK input after feeding buffered PCM audio */
+    void FinishBufferedAudioInput();
+
 private:
     bool SendText(const std::string& text) override;
 
@@ -41,12 +56,17 @@ private:
     bool audio_channel_opened_ = false;
     bool chat_session_active_ = false;
     bool pending_outputing_ = false;
+    bool close_requested_ = false;
+    bool chat_paused_ = false;
     std::string current_wake_word_;
     std::string mcp_message_buffer_;
     std::string chat_mode_;
     std::string flow_control_strategy_;
     int flow_control_max_size_ = 32;
     int flow_control_space_time_ms_ = 120;
+    std::string biz_speaker_;
+    std::string biz_message_;
+    std::string saved_task_id_;
 
     void ClearChatSessionFlags();
     void LoadRuntimeConfig();

@@ -7,6 +7,7 @@
 #include "websocket_protocol.h"
 #if CONFIG_LINGXIN_SDK_ENABLE
 #include "lingxin_sdk_protocol.h"
+#include "lingxin_sdk_bridge.h"
 #endif
 #include "assets/lang_config.h"
 #include "mcp_server.h"
@@ -14,6 +15,7 @@
 #include "settings.h"
 
 #include <cstring>
+#include <algorithm>
 #include <esp_log.h>
 #include <cJSON.h>
 #include <driver/gpio.h>
@@ -228,15 +230,17 @@ void Application::Run() {
             HandleStopListeningEvent();
         }
 
-#if !CONFIG_LINGXIN_SDK_ENABLE
+#if CONFIG_LINGXIN_SDK_ENABLE
+        if ((bits & MAIN_EVENT_SEND_AUDIO) && use_traditional_audio_upload_) {
+#else
         if (bits & MAIN_EVENT_SEND_AUDIO) {
+#endif
             while (auto packet = audio_service_.PopPacketFromSendQueue()) {
                 if (protocol_ && !protocol_->SendAudio(std::move(packet))) {
                     break;
                 }
             }
         }
-#endif
 
         if (bits & MAIN_EVENT_WAKE_WORD_DETECTED) {
             HandleWakeWordDetectedEvent();
@@ -302,6 +306,11 @@ void Application::HandleNetworkDisconnectedEvent() {
     if (state == kDeviceStateConnecting || state == kDeviceStateListening || state == kDeviceStateSpeaking) {
         ESP_LOGI(TAG, "Closing audio channel due to network disconnection");
         protocol_->CloseAudioChannel();
+#if CONFIG_LINGXIN_SDK_ENABLE
+        if (lingxin_sdk_ && lingxin_sdk_->IsAudioChannelOpened()) {
+            lingxin_sdk_->CloseAudioChannel();
+        }
+#endif
     }
 
     // Update the status bar immediately to show the network state
@@ -513,8 +522,124 @@ void Application::InitializeProtocol() {
 #endif
 
 #if CONFIG_LINGXIN_SDK_ENABLE
-    ESP_LOGI(TAG, "Lingxin SDK enabled, using Lingxin SDK protocol");
-    protocol_ = std::make_unique<LingxinSdkProtocol>();
+    {
+        Settings settings("lingxin", false);
+        chat_mode_ = settings.GetString("mode", CONFIG_LINGXIN_CHAT_MODE);
+        std::transform(chat_mode_.begin(), chat_mode_.end(), chat_mode_.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    }
+
+    if (chat_mode_ == "voice") {
+        ESP_LOGI(TAG, "Lingxin SDK voice mode: using traditional protocol + SDK backend");
+        if (ota_->HasMqttConfig()) {
+            protocol_ = std::make_unique<MqttProtocol>();
+        } else if (ota_->HasWebsocketConfig()) {
+            protocol_ = std::make_unique<WebsocketProtocol>();
+        } else {
+            ESP_LOGW(TAG, "No protocol specified in the OTA config, using MQTT");
+            protocol_ = std::make_unique<MqttProtocol>();
+        }
+        use_traditional_audio_upload_ = true;
+
+        lingxin_sdk_ = std::make_unique<LingxinSdkProtocol>();
+        lingxin_sdk_->Start();
+        ESP_LOGI(TAG, "Lingxin SDK backend initialized (standby)");
+
+        lingxin_sdk_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
+            if (GetDeviceState() == kDeviceStateSpeaking) {
+                audio_service_.PushPacketToDecodeQueue(std::move(packet));
+            }
+        });
+        lingxin_sdk_->OnAudioChannelOpened([this, codec, &board]() {
+            board.SetPowerSaveLevel(PowerSaveLevel::PERFORMANCE);
+            if (lingxin_sdk_->server_sample_rate() != codec->output_sample_rate()) {
+                ESP_LOGW(TAG, "Server sample rate %d does not match device output sample rate %d, resampling may cause distortion",
+                    lingxin_sdk_->server_sample_rate(), codec->output_sample_rate());
+            }
+        });
+        lingxin_sdk_->OnAudioChannelClosed([this, &board]() {
+            board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
+            audio_service_stop_record_to_sdk();
+            use_traditional_audio_upload_ = true;
+            audio_service_.ClearVoiceprintBuffer();
+            voiceprint_feed_pcm_.clear();
+            Schedule([this]() {
+                auto display = Board::GetInstance().GetDisplay();
+                display->SetChatMessage("system", "");
+
+                auto state = GetDeviceState();
+                bool conversation_state = state == kDeviceStateConnecting ||
+                                          state == kDeviceStateListening ||
+                                          state == kDeviceStateSpeaking;
+                if (chat_mode_ == "voice" && conversation_state && protocol_) {
+                    ESP_LOGI(TAG, "Restore traditional listening after SDK playback");
+                    if (!protocol_->IsAudioChannelOpened() && !protocol_->OpenAudioChannel()) {
+                        ESP_LOGE(TAG, "Failed to reopen traditional audio channel");
+                        SetDeviceState(kDeviceStateIdle);
+                        return;
+                    }
+                    SetDeviceState(kDeviceStateListening);
+                    return;
+                }
+
+                SetDeviceState(kDeviceStateIdle);
+            });
+        });
+        lingxin_sdk_->OnNetworkError([this](const std::string& message) {
+            last_error_message_ = message;
+            xEventGroupSetBits(event_group_, MAIN_EVENT_ERROR);
+        });
+        lingxin_sdk_->OnIncomingJson([this, display](const cJSON* root) {
+            auto header = cJSON_GetObjectItem(root, "header");
+            auto action = header ? cJSON_GetObjectItem(header, "action") : nullptr;
+            if (cJSON_IsString(action) && strcmp(action->valuestring, "text_output") == 0) {
+                auto payload = cJSON_GetObjectItem(root, "payload");
+                if (cJSON_IsObject(payload)) {
+                    auto text = cJSON_GetObjectItem(payload, "text");
+                    if (cJSON_IsString(text)) {
+                        ESP_LOGI(TAG, "<< %s", text->valuestring);
+                        Schedule([display, message = std::string(text->valuestring)]() {
+                            display->SetChatMessage("assistant", message.c_str());
+                        });
+                    }
+                }
+                return;
+            }
+            if (cJSON_IsString(action) && strcmp(action->valuestring, "asr_ended") == 0) {
+                auto payload = cJSON_GetObjectItem(root, "payload");
+                if (cJSON_IsObject(payload)) {
+                    auto text = cJSON_GetObjectItem(payload, "text");
+                    if (cJSON_IsString(text)) {
+                        ESP_LOGI(TAG, ">> %s", text->valuestring);
+                        Schedule([display, message = std::string(text->valuestring)]() {
+                            display->SetChatMessage("user", message.c_str());
+                        });
+                    }
+                }
+                return;
+            }
+            if (cJSON_IsString(action) && strcmp(action->valuestring, "task_started") == 0) {
+                Schedule([this]() {
+                    aborted_ = false;
+                    SetDeviceState(kDeviceStateSpeaking);
+                });
+                return;
+            }
+            if (cJSON_IsString(action) && strcmp(action->valuestring, "audio_ended") == 0) {
+                Schedule([this]() {
+                    if (lingxin_sdk_ && lingxin_sdk_->IsAudioChannelOpened() && chat_mode_ != "voice") {
+                        audio_service_.WaitForPlaybackQueueEmpty();
+                        lingxin_sdk_->CloseAudioChannel(false);
+                    }
+                });
+                return;
+            }
+        });
+    } else {
+        ESP_LOGI(TAG, "Lingxin SDK enabled, using Lingxin SDK protocol (mode=%s)", chat_mode_.c_str());
+        protocol_ = std::make_unique<LingxinSdkProtocol>();
+        use_traditional_audio_upload_ = false;
+    }
 #else
     if (ota_->HasMqttConfig()) {
         protocol_ = std::make_unique<MqttProtocol>();
@@ -552,6 +677,11 @@ void Application::InitializeProtocol() {
     protocol_->OnAudioChannelClosed([this, &board]() {
         board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
         Schedule([this]() {
+#if CONFIG_LINGXIN_SDK_ENABLE
+            if (lingxin_sdk_ && lingxin_sdk_->IsAudioChannelOpened()) {
+                return;
+            }
+#endif
             auto display = Board::GetInstance().GetDisplay();
             display->SetChatMessage("system", "");
             SetDeviceState(kDeviceStateIdle);
@@ -613,6 +743,45 @@ void Application::InitializeProtocol() {
         if (type == nullptr || !cJSON_IsString(type)) {
             return;
         }
+#if CONFIG_LINGXIN_SDK_ENABLE
+        if (strcmp(type->valuestring, "voiceprint") == 0) {
+            auto state = cJSON_GetObjectItem(root, "state");
+            if (strcmp(state->valuestring, "start") == 0) {
+                ESP_LOGI(TAG, "Voiceprint start received");
+                Schedule([this]() {
+                    HandleVoiceprintStart();
+                });
+                return;
+            }
+            if (strcmp(state->valuestring, "end") == 0) {
+                auto speaker = cJSON_GetObjectItem(root, "speaker");
+                auto message = cJSON_GetObjectItem(root, "message");
+                std::string speaker_name = cJSON_IsString(speaker) ? speaker->valuestring : "";
+                std::string message_text = cJSON_IsString(message) ? message->valuestring : "";
+                ESP_LOGI(TAG, "Voiceprint end received, speaker=%s, message=%s", speaker_name.c_str(), message_text.c_str());
+                Schedule([this, speaker_name, message_text]() {
+                    HandleVoiceprintEnd(speaker_name,message_text);
+                });
+                return;
+            }
+            if (strcmp(state->valuestring, "stop") == 0) {
+                ESP_LOGI(TAG, "Voiceprint stop: cleaning up and returning to listening");
+                Schedule([this]() {
+                    audio_service_stop_record_to_sdk();
+                    use_traditional_audio_upload_ = true;
+                    voiceprint_feed_pcm_.clear();
+                    voiceprint_feed_pcm_.shrink_to_fit();
+                    if (lingxin_sdk_ && lingxin_sdk_->IsAudioChannelOpened()) {
+                        lingxin_sdk_->CloseAudioChannel(false);
+                    }
+
+                    SetDeviceState(kDeviceStateListening);
+                });
+                return;
+            }
+        }
+
+#endif
         if (strcmp(type->valuestring, "tts") == 0) {
             auto state = cJSON_GetObjectItem(root, "state");
             if (strcmp(state->valuestring, "start") == 0) {
@@ -931,7 +1100,10 @@ void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
     }
 
     ESP_LOGI(TAG, "Wake word detected: %s", wake_word.c_str());
-#if CONFIG_SEND_WAKE_WORD_DATA && !CONFIG_LINGXIN_SDK_ENABLE
+#if CONFIG_SEND_WAKE_WORD_DATA
+#if CONFIG_LINGXIN_SDK_ENABLE
+    if (use_traditional_audio_upload_) {
+#endif
     // Encode and send the wake word data to the server
     while (auto packet = audio_service_.PopWakeWordPacket()) {
         protocol_->SendAudio(std::move(packet));
@@ -942,11 +1114,85 @@ void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
     // Set flag to play popup sound after state changes to listening
     play_popup_on_listening_ = true;
     SetListeningMode(GetDefaultListeningMode());
+#if CONFIG_LINGXIN_SDK_ENABLE
+    } else {
+        play_popup_on_listening_ = true;
+        SetListeningMode(GetDefaultListeningMode());
+    }
+#endif
 #else
     // Set flag to play popup sound after state changes to listening
     // (PlaySound here would be cleared by ResetDecoder in EnableVoiceProcessing)
     play_popup_on_listening_ = true;
     SetListeningMode(GetDefaultListeningMode());
+#endif
+}
+
+#if CONFIG_LINGXIN_SDK_ENABLE
+
+void Application::HandleVoiceprintStart() {
+    ESP_LOGI(TAG, "HandleVoiceprintStart: stopping recording and audio upload");
+    if (protocol_) {
+        protocol_->SendStopListening();
+    }
+    voiceprint_pending_ = true;
+    use_traditional_audio_upload_ = false;
+    audio_service_.EnableVoiceProcessing(false);
+}
+
+void Application::HandleVoiceprintEnd(const std::string& speaker, const std::string& message) {
+    ESP_LOGI(TAG, "HandleVoiceprintEnd: speaker=%s, message=%s, switching to Lingxin SDK", speaker.c_str(), message.c_str());
+    if (!lingxin_sdk_ || !lingxin_sdk_->IsInitialized()) {
+        ESP_LOGE(TAG, "Lingxin SDK not initialized");
+        voiceprint_pending_ = false;
+        use_traditional_audio_upload_ = true;
+        audio_service_.EnableVoiceProcessing(true);
+        return;
+    }
+
+    lingxin_sdk_->SetSpeaker(speaker, message);
+
+    bool traditional_was_open = protocol_ && protocol_->IsAudioChannelOpened();
+    if (traditional_was_open) {
+        protocol_->CloseAudioChannel(false);
+    }
+
+    if (!lingxin_sdk_->OpenAudioChannel()) {
+        ESP_LOGE(TAG, "Failed to open Lingxin SDK audio channel");
+        voiceprint_pending_ = false;
+        use_traditional_audio_upload_ = true;
+        audio_service_.EnableVoiceProcessing(true);
+        if (traditional_was_open && !protocol_->IsAudioChannelOpened()) {
+            protocol_->OpenAudioChannel();
+        }
+        return;
+    }
+
+    auto buffered_pcm = audio_service_.GetVoiceprintBuffer();
+    audio_service_.EnableVoiceprintBuffer(false);
+    ESP_LOGI(TAG, "Buffered PCM samples for voiceprint: %u", (unsigned)buffered_pcm.size());
+
+    // First round: recorder not yet open (audio_channel_opened_=false), store for bridge.
+    // Subsequent rounds: recorder already open from previous round, feed directly.
+    if (lingxin_sdk_->IsRecorderOpen()) {
+        lingxin_sdk_->FeedBufferedAudio(buffered_pcm);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        lingxin_sdk_->FinishBufferedAudioInput();
+    } else {
+        voiceprint_feed_pcm_ = std::move(buffered_pcm);
+    }
+
+    voiceprint_pending_ = false;
+    ESP_LOGI(TAG, "Switched to Lingxin SDK successfully");
+}
+
+#endif
+
+bool Application::IsChatModeVoice() const {
+#if CONFIG_LINGXIN_SDK_ENABLE
+    return chat_mode_ == "voice";
+#else
+    return false;
 #endif
 }
 
@@ -960,7 +1206,11 @@ void Application::HandleStateChangedEvent() {
     led->OnStateChanged();
 
     // 发送状态变化到服务器
+#if CONFIG_LINGXIN_SDK_ENABLE
+    if (protocol_ && protocol_->IsAudioChannelOpened() && use_traditional_audio_upload_) {
+#else
     if (protocol_ && protocol_->IsAudioChannelOpened()) {
+#endif
         const char* state_str = "";
         switch (new_state) {
             case kDeviceStateUnknown: state_str = "unknown"; break;
@@ -986,6 +1236,9 @@ void Application::HandleStateChangedEvent() {
             display->SetEmotion("neutral"); // Then set emotion (wechat mode checks child count)
             audio_service_.EnableVoiceProcessing(false);
             audio_service_.EnableWakeWordDetection(true);
+#if CONFIG_LINGXIN_SDK_ENABLE
+            audio_service_.EnableVoiceprintBuffer(false);
+#endif
 #if CONFIG_ENABLE_ENVIRONMENT_SOUND_DETECTION
             // Start background audio monitoring for environment sound upload
                             audio_monitor_.Start();
@@ -1013,8 +1266,19 @@ void Application::HandleStateChangedEvent() {
                 }
 
                 // Send the start listening command
+#if CONFIG_LINGXIN_SDK_ENABLE
+                if (use_traditional_audio_upload_) {
+#endif
                 protocol_->SendStartListening(listening_mode_);
+#if CONFIG_LINGXIN_SDK_ENABLE
+                }
+#endif
                 audio_service_.EnableVoiceProcessing(true);
+#if CONFIG_LINGXIN_SDK_ENABLE
+                if (use_traditional_audio_upload_ && !voiceprint_pending_) {
+                    audio_service_.EnableVoiceprintBuffer(true);
+                }
+#endif
             }
 
 #ifdef CONFIG_WAKE_WORD_DETECTION_IN_LISTENING
@@ -1253,6 +1517,12 @@ void Application::ResetProtocol() {
         }
         // Reset protocol
         protocol_.reset();
+#if CONFIG_LINGXIN_SDK_ENABLE
+        if (lingxin_sdk_ && lingxin_sdk_->IsAudioChannelOpened()) {
+            lingxin_sdk_->CloseAudioChannel();
+        }
+        lingxin_sdk_.reset();
+#endif
     });
 }
 

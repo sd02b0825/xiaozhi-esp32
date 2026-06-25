@@ -18,6 +18,8 @@ extern "C" {
 #include "audio_buffer_play.h"
 }
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include <cJSON.h>
 #include <algorithm>
 #include <cctype>
@@ -95,8 +97,44 @@ char* LingxinSdkProtocol::GetDeviceCode() {
 
 char* LingxinSdkProtocol::GetBizParameter() {
     std::string device_code = GetLingxinConfigString("device_code", CONFIG_LINGXIN_DEVICE_CODE);
+    auto* self = GetInstance();
+    std::string speaker = self ? self->biz_speaker_ : "";
+    std::string message = self ? self->biz_message_ : "";
     
-    static std::string json = "{\"device_code\":\"" + device_code + "\",\"conversation_template_params\":[{\"name\": \"speaker\", \"value\": \"张三\"}]}";
+
+    cJSON* root = cJSON_CreateObject();
+    if (!root) {
+        ESP_LOGE(TAG, "GetBizParameter: cJSON_CreateObject failed");
+        static std::string empty_json = "{}";
+        return const_cast<char*>(empty_json.c_str());
+    }
+    cJSON_AddStringToObject(root, "device_code", device_code.c_str());
+    cJSON* conversation_template_params = cJSON_AddArrayToObject(root, "conversation_template_params");
+    if (conversation_template_params) {
+        cJSON* param1 = cJSON_CreateObject();
+        if (param1) {
+            cJSON_AddStringToObject(param1, "name", "speaker");
+            cJSON_AddStringToObject(param1, "value", speaker.c_str());
+            cJSON_AddItemToArray(conversation_template_params, param1);
+        }
+        cJSON* param2 = cJSON_CreateObject();
+        if (param2) {
+            cJSON_AddStringToObject(param2, "name", "message");
+            cJSON_AddStringToObject(param2, "value", message.c_str());
+            cJSON_AddItemToArray(conversation_template_params, param2);
+        }
+    }
+
+    static std::string json;
+    char* printed = cJSON_PrintUnformatted(root);
+    if (printed) {
+        json = printed;
+        cJSON_free(printed);
+    } else {
+        json = "{}";
+    }
+    ESP_LOGI(TAG, "GetBizParameter: %s", json.c_str());
+    cJSON_Delete(root);
     return const_cast<char*>(json.c_str());
 }
 
@@ -227,7 +265,7 @@ void LingxinSdkProtocol::ApplyChatPhase(ChatPhaseCode phase) {
         pending_outputing_ = false;
         bool notify_close = chat_session_active_ || audio_channel_opened_;
         ClearChatSessionFlags();
-        if (notify_close && on_audio_channel_closed_) {
+        if (notify_close && on_audio_channel_closed_ && !chat_paused_) {
             on_audio_channel_closed_();
         }
         break;
@@ -315,7 +353,14 @@ void LingxinSdkProtocol::HandleTextOut(char *text) {
     if (text && on_incoming_json_) {
         cJSON *root = cJSON_Parse(text);
         if (root) {
-            cJSON *header_obj = cJSON_GetObjectItem(root, "header");
+            auto header_obj = cJSON_GetObjectItem(root, "header");
+            if (cJSON_IsObject(header_obj)) {
+                auto task_id = cJSON_GetObjectItem(header_obj, "task_id");
+                if (cJSON_IsString(task_id) && task_id->valuestring != nullptr) {
+                    saved_task_id_ = task_id->valuestring;
+                    ESP_LOGI(TAG, "HandleTextOut: captured task_id=%s", saved_task_id_.c_str());
+                }
+            }
             cJSON *action = cJSON_IsObject(header_obj) ? cJSON_GetObjectItem(header_obj, "action") : nullptr;
             if (!cJSON_IsString(action)) {
                 if (!cJSON_IsObject(header_obj)) {
@@ -334,10 +379,25 @@ void LingxinSdkProtocol::HandleTextOut(char *text) {
 }
 
 void LingxinSdkProtocol::HandleExit(ExitCode exit_code, char *reason) {
-    ESP_LOGI(TAG, "HandleExit: code=%d, reason=%s", exit_code, reason ? reason : "null");
+    ESP_LOGI(TAG, "HandleExit: code=%d, reason=%s, paused=%d", exit_code, reason ? reason : "null", chat_paused_);
+
+    if (chat_paused_ && exit_code == EXIT_REASON_USER_INITIATED) {
+        pending_outputing_ = false;
+        chat_session_active_ = false;
+        audio_channel_opened_ = false;
+        close_requested_ = false;
+        ESP_LOGI(TAG, "HandleExit: paused, keeping saved_task_id=%s for next round", saved_task_id_.c_str());
+        if (on_audio_channel_closed_) {
+            on_audio_channel_closed_();
+        }
+        free(reason);
+        return;
+    }
+
     pending_outputing_ = false;
     bool notify_close = chat_session_active_ || audio_channel_opened_;
     ClearChatSessionFlags();
+    chat_paused_ = false;
     if (notify_close && on_audio_channel_closed_) {
         on_audio_channel_closed_();
     }
@@ -349,6 +409,16 @@ void LingxinSdkProtocol::HandlePlayEnd() {
     pending_outputing_ = false;
     auto& app = Application::GetInstance();
     app.GetAudioService().WaitForPlaybackQueueEmpty();
+
+    if (chat_mode_ == "voice" && IsAudioChannelOpened()) {
+        ESP_LOGI(TAG, "HandlePlayEnd: pausing SDK (keep WS alive, reuse task_id)");
+        chat_paused_ = true;
+        ExitChatProps exit_props = get_exit_chat_default_props();
+        exit_props.disable_close_ws_immediately = true;
+        exit_chat(&exit_props);
+        return;
+    }
+
     if (audio_service_is_sdk_uplink_active()) {
         return;
     }
@@ -377,6 +447,7 @@ void LingxinSdkProtocol::ClearChatSessionFlags() {
     chat_session_active_ = false;
     audio_channel_opened_ = false;
     pending_outputing_ = false;
+    close_requested_ = false;
 }
 
 bool LingxinSdkProtocol::Start() {
@@ -423,13 +494,20 @@ bool LingxinSdkProtocol::OpenAudioChannel() {
         return true;
     }
 
-    ESP_LOGI(TAG, "Opening audio channel (start_new_chat)");
+    ESP_LOGI(TAG, "Opening audio channel (start_new_chat), paused=%d, saved_task_id=%s",
+             chat_paused_, saved_task_id_.c_str());
+    close_requested_ = false;
 
     StartNewChatProps start_props = get_start_new_chat_default_props();
     start_props.disable_welcome_audio = true;
     start_props.single_round = false;
-    start_props.play_prologue = true;   
+    start_props.play_prologue = false;
     ApplyStartNewChatProps(start_props);
+
+    if (chat_paused_ && !saved_task_id_.empty()) {
+        start_props.task_id = const_cast<char*>(saved_task_id_.c_str());
+        ESP_LOGI(TAG, "Resuming with saved task_id=%s", saved_task_id_.c_str());
+    }
 
     int ret = start_new_chat(&start_props);
     if (ret != 0) {
@@ -438,19 +516,26 @@ bool LingxinSdkProtocol::OpenAudioChannel() {
     }
 
     chat_session_active_ = true;
+    chat_paused_ = false;
     return true;
 }
 
 void LingxinSdkProtocol::CloseAudioChannel(bool send_goodbye) {
-    (void)send_goodbye;
-    ESP_LOGI(TAG, "Closing audio channel (exit_chat)");
+    ESP_LOGI(TAG, "Closing audio channel (exit_chat), send_goodbye=%d", send_goodbye);
 
     if (!sdk_initialized_) {
         return;
     }
+    if (close_requested_) {
+        ESP_LOGD(TAG, "CloseAudioChannel already requested, skip duplicate exit_chat");
+        return;
+    }
+    close_requested_ = true;
 
     ExitChatProps exit_props = get_exit_chat_default_props();
-    exit_props.disable_close_ws_immediately = false;
+    // send_goodbye=false → pause mode: keep WS alive, task_id reused on continue
+    // send_goodbye=true  → full close: disconnect WS, new task_id on next session
+    exit_props.disable_close_ws_immediately = !send_goodbye;
 
     int ret = exit_chat(&exit_props);
     if (ret != 0) {
@@ -492,6 +577,21 @@ void LingxinSdkProtocol::SendStopListening() {
     stop_chat_record(&stop_props);
 }
 
+void LingxinSdkProtocol::FinishBufferedAudioInput() {
+    if (!sdk_initialized_ || !chat_session_active_) {
+        ESP_LOGW(TAG, "FinishBufferedAudioInput ignored: sdk_initialized=%d session_active=%d",
+                 sdk_initialized_, chat_session_active_);
+        return;
+    }
+
+    ESP_LOGI(TAG, "FinishBufferedAudioInput: stop SDK record after buffered PCM");
+    StopChatRecordProps stop_props = {};
+    int ret = stop_chat_record(&stop_props);
+    if (ret != 0) {
+        ESP_LOGE(TAG, "FinishBufferedAudioInput: stop_chat_record failed: %d", ret);
+    }
+}
+
 void LingxinSdkProtocol::SendAbortSpeaking(AbortReason reason) {
     (void)reason;
     ESP_LOGI(TAG, "SendAbortSpeaking: SDK terminate (Wakeup_Detected)");
@@ -531,6 +631,50 @@ void LingxinSdkProtocol::SendMcpMessage(const std::string& message) {
 bool LingxinSdkProtocol::SendText(const std::string& text) {
     (void)text;
     return true;
+}
+
+void LingxinSdkProtocol::SetSpeaker(const std::string& speaker, const std::string& message) {
+    biz_speaker_ = speaker;
+    biz_message_ = message;
+    ESP_LOGI(TAG, "Speaker set to: %s, message: %s", speaker.c_str(), message.c_str());
+}
+
+void LingxinSdkProtocol::FeedBufferedAudio(const std::vector<int16_t>& pcm_data) {
+    if (pcm_data.empty()) {
+        return;
+    }
+    // Write in chunks to avoid ringbuf overflow (NOSPLIT requires contiguous space).
+    // Each chunk is 8KB (4096 samples), well within the 256KB ringbuf capacity.
+    constexpr size_t kChunkSamples = 4096;
+    const int16_t* src = pcm_data.data();
+    size_t remaining = pcm_data.size();
+    size_t written = 0;
+    int fail_count = 0;
+
+    while (remaining > 0) {
+        size_t chunk = std::min(remaining, kChunkSamples);
+        const uint8_t* data = reinterpret_cast<const uint8_t*>(src + written);
+        size_t len = chunk * sizeof(int16_t);
+        if (lingxin_record_write_pcm(data, len) == 0) {
+            written += chunk;
+            remaining -= chunk;
+            fail_count = 0;
+            // Let the SDK recorder task drain ringbuf into its send buffer during bulk replay.
+            vTaskDelay(pdMS_TO_TICKS(1));
+        } else {
+            fail_count++;
+            ESP_LOGW(TAG, "FeedBufferedAudio: chunk write failed at %u/%u, retry %d",
+                     (unsigned)written, (unsigned)pcm_data.size(), fail_count);
+            if (fail_count > 50) {
+                ESP_LOGE(TAG, "FeedBufferedAudio: giving up after %d retries at %u/%u",
+                         fail_count, (unsigned)written, (unsigned)pcm_data.size());
+                break;
+            }
+            // Wait for recorder thread to drain ringbuf space
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+    }
+    ESP_LOGI(TAG, "FeedBufferedAudio: wrote %u/%u samples", (unsigned)written, (unsigned)pcm_data.size());
 }
 
 #endif  // CONFIG_LINGXIN_SDK_ENABLE

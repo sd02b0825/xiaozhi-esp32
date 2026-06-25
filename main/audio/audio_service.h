@@ -154,6 +154,12 @@ public:
     void SetProcessorTaskPriority(UBaseType_t priority);
 #endif
 
+#if CONFIG_LINGXIN_SDK_ENABLE
+    void EnableVoiceprintBuffer(bool enable);
+    std::vector<int16_t> GetVoiceprintBuffer();
+    void ClearVoiceprintBuffer();
+#endif
+
 private:
     AudioCodec* codec_ = nullptr;
     AudioServiceCallbacks callbacks_;
@@ -201,6 +207,12 @@ private:
     bool voice_detected_ = false;
     bool service_stopped_ = true;
     bool audio_input_need_warmup_ = false;
+
+#if CONFIG_LINGXIN_SDK_ENABLE
+    std::atomic<bool> voiceprint_buffer_enabled_{false};
+    std::vector<int16_t> voiceprint_pcm_buffer_;
+    std::mutex voiceprint_buffer_mutex_;
+#endif
 
     esp_timer_handle_t audio_power_timer_ = nullptr;
     std::chrono::steady_clock::time_point last_input_time_;
