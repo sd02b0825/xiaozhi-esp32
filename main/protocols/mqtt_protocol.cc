@@ -62,6 +62,9 @@ bool MqttProtocol::StartMqttClient(bool report_error) {
         mqtt_.reset();
     }
 
+    // 重建 MQTT 客户端时，先前的 session 一定失效，清除标志强制走完整 hello。
+    hello_sent_ = false;
+
     Settings settings("mqtt", false);
     auto endpoint = settings.GetString("endpoint");
     auto client_id = settings.GetString("client_id");
@@ -83,6 +86,8 @@ bool MqttProtocol::StartMqttClient(bool report_error) {
     mqtt_->SetKeepAlive(keepalive_interval);
 
     mqtt_->OnDisconnected([this]() {
+        // MQTT 断开则 session 不再有效，下次开通道必须重新 hello。
+        hello_sent_ = false;
         if (on_disconnected_ != nullptr) {
             on_disconnected_();
         }
@@ -116,6 +121,9 @@ bool MqttProtocol::StartMqttClient(bool report_error) {
             auto session_id = cJSON_GetObjectItem(root, "session_id");
             ESP_LOGI(TAG, "Received goodbye message, session_id: %s", session_id ? session_id->valuestring : "null");
             if (session_id == nullptr || session_id_ == session_id->valuestring) {
+                // 服务器主动放弃当前 session：无论是否与本地 session_id 匹配，
+                // 都视为对端 session 不再有效，下次 OpenAudioChannel 必须重新走完整 hello。
+                hello_sent_ = false;
                 auto alive = alive_;  // Capture alive flag
                 Application::GetInstance().Schedule([this, alive]() {
                     if (*alive) {
@@ -205,6 +213,8 @@ void MqttProtocol::CloseAudioChannel(bool send_goodbye) {
         message += "\"type\":\"goodbye\"";
         message += "}";
         SendText(message);
+        // 客户端主动 goodbye 后，本次 session 已终结，下次开通道必须重新 hello。
+        hello_sent_ = false;
     }
 
     if (on_audio_channel_closed_ != nullptr) {
@@ -218,6 +228,21 @@ bool MqttProtocol::OpenAudioChannel() {
         if (!StartMqttClient(true)) {
             return false;
         }
+    }
+
+    // 若上一次 hello 建立的 session 仍然有效（MQTT 未断、未发送/收到过 goodbye、未出错也未超时），
+    // 则复用旧的 UDP 参数与 session_id，跳过 hello，避免服务器把它当作重复 hello 而下发 goodbye
+    // 导致 session_id 被重置。
+    if (hello_sent_ && !udp_server_.empty() && !error_occurred_ && !IsTimeout()) {
+        ESP_LOGI(TAG, "Reusing existing session %s, skip hello", session_id_.c_str());
+        {
+            std::lock_guard<std::mutex> lock(channel_mutex_);
+            SetupUdpChannel();
+        }
+        if (on_audio_channel_opened_ != nullptr) {
+            on_audio_channel_opened_();
+        }
+        return true;
     }
 
     error_occurred_ = false;
@@ -237,7 +262,24 @@ bool MqttProtocol::OpenAudioChannel() {
         return false;
     }
 
-    std::lock_guard<std::mutex> lock(channel_mutex_);
+    {
+        std::lock_guard<std::mutex> lock(channel_mutex_);
+        SetupUdpChannel();
+    }
+
+    // 完整 hello 流程成功后，标记 session 活跃，供后续 OpenAudioChannel 复用。
+    hello_sent_ = true;
+
+    if (on_audio_channel_opened_ != nullptr) {
+        on_audio_channel_opened_();
+    }
+    return true;
+}
+
+void MqttProtocol::SetupUdpChannel() {
+    // 使用当前 udp_server_/udp_port_/aes_ctx_/aes_nonce_ 建立 UDP 通道并注册消息回调。
+    // 调用者必须持有 channel_mutex_。
+    udp_.reset();
     auto network = Board::GetInstance().GetNetwork();
     udp_ = network->CreateUdp(2);
     udp_->OnMessage([this](const std::string& data) {
@@ -287,11 +329,12 @@ bool MqttProtocol::OpenAudioChannel() {
     });
 
     udp_->Connect(udp_server_, udp_port_);
+}
 
-    if (on_audio_channel_opened_ != nullptr) {
-        on_audio_channel_opened_();
-    }
-    return true;
+void MqttProtocol::SetError(const std::string& message) {
+    // 任何错误路径都视为 session 失效，下次 OpenAudioChannel 必须重新走 hello。
+    hello_sent_ = false;
+    Protocol::SetError(message);
 }
 
 std::string MqttProtocol::GetHelloMessage() {
@@ -306,7 +349,7 @@ std::string MqttProtocol::GetHelloMessage() {
 #endif
     cJSON_AddBoolToObject(features, "mcp", true);
 
-    cJSON_AddBoolToObject(features, "sdk", Application::GetInstance().IsLingxinSdkEnabled());
+    cJSON_AddBoolToObject(features, "lingxin_sdk", Application::GetInstance().IsLingxinSdkEnabled());
     cJSON_AddBoolToObject(features, "chat_voice", Application::GetInstance().IsChatModeVoice());
 
     cJSON_AddItemToObject(root, "features", features);

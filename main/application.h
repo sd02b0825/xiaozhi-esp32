@@ -134,6 +134,13 @@ public:
         return empty;
 #endif
     }
+    bool IsTraditionalUploadEnabled() const {
+#if CONFIG_LINGXIN_SDK_ENABLE
+        return use_traditional_audio_upload_;
+#else
+        return true;
+#endif
+    }
     
     /**
      * Reset protocol resources (thread-safe)

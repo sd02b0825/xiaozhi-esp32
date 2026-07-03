@@ -7,6 +7,7 @@
 
 #if CONFIG_LINGXIN_SDK_ENABLE
 #include "lingxin_sdk_bridge.h"
+#include "application.h"
 #endif
 
 #include "audio_decoder.h"
@@ -137,6 +138,16 @@ void AudioService::Initialize(AudioCodec* codec) {
             }
         }
 #endif
+
+#if CONFIG_LINGXIN_SDK_ENABLE
+        // SDK 会话中非录音期间, 传统协议上传已关闭, 编码队列无人消费.
+        // 将数据处理后路由到编码队列会导致回压阻塞 fetch_with_delay() → AFE ringbuffer 溢出.
+        // 此处直接丢弃——SDK 会话活跃期间, 这些数据本就不应通过传统通道发送.
+        if (!Application::GetInstance().IsTraditionalUploadEnabled()) {
+            return;
+        }
+#endif
+
         PushTaskToEncodeQueue(kAudioTaskTypeEncodeToSendQueue, std::move(data));
     });
 

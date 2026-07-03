@@ -53,12 +53,22 @@ private:
     uint32_t remote_sequence_;
     esp_timer_handle_t reconnect_timer_;
 
+    // 标记服务器 session 是否仍活跃（客户端已发送并收到 hello，且尚未 goodbye/断线/出错）。
+    // 若为 true，OpenAudioChannel 可以复用先前 server hello 返回的 UDP 参数，跳过重复 hello。
+    bool hello_sent_ = false;
+
     bool StartMqttClient(bool report_error=false);
     void ParseServerHello(const cJSON* root);
     std::string DecodeHexString(const std::string& hex_string);
+    // 使用当前 udp_server_/udp_port_/aes_* 建立 UDP 通道并注册回调。
+    // 调用者必须持有 channel_mutex_。
+    void SetupUdpChannel();
 
     bool SendText(const std::string& text) override;
     std::string GetHelloMessage();
+
+protected:
+    void SetError(const std::string& message) override;
 };
 
 

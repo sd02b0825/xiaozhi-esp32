@@ -745,27 +745,27 @@ void Application::InitializeProtocol() {
         }
 #if CONFIG_LINGXIN_SDK_ENABLE
         if (strcmp(type->valuestring, "voiceprint") == 0) {
-            auto state = cJSON_GetObjectItem(root, "state");
-            if (strcmp(state->valuestring, "start") == 0) {
-                ESP_LOGI(TAG, "Voiceprint start received");
+            auto state = cJSON_GetObjectItem(root, "action");
+            if (strcmp(state->valuestring, "end") == 0) {
+                ESP_LOGI(TAG, "Voiceprint end received");
                 Schedule([this]() {
                     HandleVoiceprintStart();
                 });
                 return;
             }
-            if (strcmp(state->valuestring, "end") == 0) {
+            if (strcmp(state->valuestring, "success") == 0) {
                 auto speaker = cJSON_GetObjectItem(root, "speaker");
                 auto message = cJSON_GetObjectItem(root, "message");
                 std::string speaker_name = cJSON_IsString(speaker) ? speaker->valuestring : "";
                 std::string message_text = cJSON_IsString(message) ? message->valuestring : "";
-                ESP_LOGI(TAG, "Voiceprint end received, speaker=%s, message=%s", speaker_name.c_str(), message_text.c_str());
+                ESP_LOGI(TAG, "Voiceprint success received, speaker=%s, message=%s", speaker_name.c_str(), message_text.c_str());
                 Schedule([this, speaker_name, message_text]() {
                     HandleVoiceprintEnd(speaker_name,message_text);
                 });
                 return;
             }
-            if (strcmp(state->valuestring, "stop") == 0) {
-                ESP_LOGI(TAG, "Voiceprint stop: cleaning up and returning to listening");
+            if (strcmp(state->valuestring, "fail") == 0) {
+                ESP_LOGI(TAG, "Voiceprint fail: cleaning up and returning to listening");
                 Schedule([this]() {
                     audio_service_stop_record_to_sdk();
                     use_traditional_audio_upload_ = true;
@@ -774,6 +774,14 @@ void Application::InitializeProtocol() {
                     if (lingxin_sdk_ && lingxin_sdk_->IsAudioChannelOpened()) {
                         lingxin_sdk_->CloseAudioChannel(false);
                     }
+
+                    // HandleVoiceprintStart 已关闭 voice processing 并将 voiceprint_pending_ 置 true，
+                    // 这里在返回 listening 前显式恢复，确保下一次唤醒能重新收集声纹缓冲。
+                    // 注意 HandleStateChangedEvent 的 listening 分支在 audio processor 仍运行时不会
+                    // 重复调用这两个方法，所以必须在此显式恢复。
+                    voiceprint_pending_ = false;
+                    audio_service_.EnableVoiceProcessing(true);
+                    audio_service_.EnableVoiceprintBuffer(true);
 
                     SetDeviceState(kDeviceStateListening);
                 });
