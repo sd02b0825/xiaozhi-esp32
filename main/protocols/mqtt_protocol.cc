@@ -305,6 +305,11 @@ std::string MqttProtocol::GetHelloMessage() {
     cJSON_AddBoolToObject(features, "aec", true);
 #endif
     cJSON_AddBoolToObject(features, "mcp", true);
+#if CONFIG_DISABLE_WAKE_WORD_TRIGGER
+    cJSON_AddBoolToObject(features, "disable_wake_word_trigger", true);
+#else
+    cJSON_AddBoolToObject(features, "disable_wake_word_trigger", false);
+#endif
     cJSON_AddItemToObject(root, "features", features);
     cJSON* audio_params = cJSON_CreateObject();
     cJSON_AddStringToObject(audio_params, "format", "opus");

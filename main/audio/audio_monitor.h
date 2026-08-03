@@ -17,6 +17,11 @@
 #include <functional>
 #include <memory>
 
+// Forward declaration to avoid pulling the full Http definition into the header.
+// The complete type is required only where the AudioMonitor destructor is
+// instantiated (i.e. in audio_monitor.cc, which includes board.h).
+class Http;
+
 /**
  * @brief Ring buffer for lock-free single-producer single-consumer audio data
  *
@@ -169,6 +174,13 @@ private:
     static constexpr int UPLOAD_TASK_STACK_SIZE = 8192;  // Increased for HTTP + base64 operations
     static constexpr int UPLOAD_TASK_PRIORITY = 5;
     static constexpr int HTTP_TIMEOUT_MS = 10000;  // 10 seconds HTTP timeout
+    // Grace period after closing the HTTP client before destroying it.
+    // tcp_->Disconnect() is asynchronous: EspTcp::ReceiveTask may still fire
+    // the OnTcpDisconnected callback shortly after Close() returns. Waiting a
+    // bit ensures the callback completes on a still-valid HttpClient object,
+    // avoiding the use-after-free / IWDT crash observed when the client was
+    // destroyed immediately after Close().
+    static constexpr int HTTP_CLOSE_GRACE_MS = 200;
 
     // State
     std::atomic<bool> running_{false};
@@ -177,6 +189,12 @@ private:
 
     // Synchronization for start/stop operations
     std::mutex state_mutex_;
+
+    // Reusable HTTP client. Kept alive across uploads to avoid the
+    // create/destroy race with EspTcp::ReceiveTask's async OnTcpDisconnected
+    // callback that caused the IWDT crash. Created lazily on first upload,
+    // destroyed in Stop() with a grace period.
+    std::unique_ptr<Http> http_;
 
     // Ring buffer for audio data (fixed memory allocation)
     std::unique_ptr<AudioRingBuffer> ring_buffer_;

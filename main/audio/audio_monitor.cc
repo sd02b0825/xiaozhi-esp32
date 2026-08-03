@@ -237,6 +237,18 @@ void AudioMonitor::Stop() {
         upload_task_handle_ = nullptr;
     }
 
+    // Tear down the reusable HTTP client. The upload task has now exited, so
+    // http_ is no longer in use. Close() triggers an asynchronous disconnect
+    // inside EspTcp; its ReceiveTask may invoke OnTcpDisconnected shortly
+    // after Close() returns. We wait for the grace period before destroying
+    // the object so the callback always runs on a valid HttpClient, avoiding
+    // the use-after-free / IWDT crash.
+    if (http_ != nullptr) {
+        http_->Close();
+        vTaskDelay(pdMS_TO_TICKS(HTTP_CLOSE_GRACE_MS));
+        http_.reset();
+    }
+
     // Clear buffer
     ring_buffer_->Clear();
 
@@ -317,12 +329,18 @@ void AudioMonitor::UploadAudio(const std::vector<int16_t>& audio_data) {
         return;
     }
 
-    // Create HTTP client
-    auto http = network->CreateHttp(HTTP_TIMEOUT_MS);
-    if (http == nullptr) {
-        ESP_LOGE(TAG, "Failed to create HTTP client");
-        upload_error_count_++;
-        return;
+    // Reuse the persistent HTTP client across uploads instead of creating and
+    // destroying one per request. Destroying the client right after Close()
+    // raced with EspTcp::ReceiveTask's async OnTcpDisconnected callback and
+    // caused an IWDT crash (use-after-free on the client's mutex). Keeping the
+    // client alive guarantees the callback always targets a valid object.
+    if (http_ == nullptr) {
+        http_ = network->CreateHttp(HTTP_TIMEOUT_MS);
+        if (http_ == nullptr) {
+            ESP_LOGE(TAG, "Failed to create HTTP client");
+            upload_error_count_++;
+            return;
+        }
     }
 
     // Convert PCM to base64
@@ -332,25 +350,25 @@ void AudioMonitor::UploadAudio(const std::vector<int16_t>& audio_data) {
     std::string json_body = BuildJsonPayload(base64_data);
 
     // Set HTTP headers
-    http->SetHeader("Content-Type", "application/json");
-    http->SetHeader("User-Agent", SystemInfo::GetUserAgent());
-    http->SetHeader("Device-Id", SystemInfo::GetMacAddress().c_str());
+    http_->SetHeader("Content-Type", "application/json");
+    http_->SetHeader("User-Agent", SystemInfo::GetUserAgent());
+    http_->SetHeader("Device-Id", SystemInfo::GetMacAddress().c_str());
 
     // Set request body
-    http->SetContent(std::move(json_body));
+    http_->SetContent(std::move(json_body));
 
     // Send POST request
-    if (!http->Open("POST", upload_url_)) {
-        ESP_LOGE(TAG, "HTTP request failed, error: 0x%x", http->GetLastError());
+    if (!http_->Open("POST", upload_url_)) {
+        ESP_LOGE(TAG, "HTTP request failed, error: 0x%x", http_->GetLastError());
         upload_error_count_++;
         // Connection not opened, no need to call Close()
         return;
     }
 
     // Check response status
-    int status_code = http->GetStatusCode();
+    int status_code = http_->GetStatusCode();
     if (status_code == 200) {
-        std::string response = http->ReadAll();
+        std::string response = http_->ReadAll();
 
         // Parse response to check success flag
         cJSON* root = cJSON_Parse(response.c_str());
@@ -378,7 +396,11 @@ void AudioMonitor::UploadAudio(const std::vector<int16_t>& audio_data) {
         upload_error_count_++;
     }
 
-    http->Close();
+    // Close the connection (but keep the client object alive for reuse).
+    // The actual disconnect notification is delivered asynchronously by
+    // EspTcp::ReceiveTask; since the client is not destroyed here, the
+    // OnTcpDisconnected callback remains safe.
+    http_->Close();
 }
 
 std::string AudioMonitor::PcmToBase64(const std::vector<int16_t>& pcm) {

@@ -700,6 +700,14 @@ choice WAKE_WORD_TYPE
 
 endchoice
 
+config DISABLE_WAKE_WORD_TRIGGER
+    bool "Disable Wake Word Trigger"
+    default n
+    help
+        When enabled, wake word detections are ignored by the application.
+        Other audio input, voice processing, and manual interaction features
+        keep their existing behavior.
+
 config CUSTOM_WAKE_WORD
     string "Custom Wake Word"
     default "xiao tu dou"

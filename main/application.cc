@@ -615,8 +615,27 @@ void Application::InitializeProtocol() {
                         Reboot();
                     });
                 } else if (strcmp(command->valuestring, "listening") == 0) {
-                    // 进入监听状态
-                    xEventGroupSetBits(event_group_, MAIN_EVENT_WAKE_WORD_DETECTED);
+                    // Remote listen: use default mode (AutoStop/Realtime), not ManualStop
+                    Schedule([this]() {
+                        if (!protocol_) {
+                            return;
+                        }
+                        auto state = GetDeviceState();
+                        ListeningMode mode = GetDefaultListeningMode();
+                        if (state == kDeviceStateIdle) {
+                            if (!protocol_->IsAudioChannelOpened()) {
+                                SetDeviceState(kDeviceStateConnecting);
+                                Schedule([this, mode]() {
+                                    ContinueOpenAudioChannel(mode);
+                                });
+                            } else {
+                                SetListeningMode(mode);
+                            }
+                        } else if (state == kDeviceStateSpeaking) {
+                            AbortSpeaking(kAbortReasonNone);
+                            SetListeningMode(mode);
+                        }
+                    });
                 } else {
                     ESP_LOGW(TAG, "Unknown system command: %s", command->valuestring);
                 }
@@ -815,6 +834,11 @@ void Application::HandleStopListeningEvent() {
 }
 
 void Application::HandleWakeWordDetectedEvent() {
+#if CONFIG_DISABLE_WAKE_WORD_TRIGGER
+    ESP_LOGI(TAG, "Wake word trigger is disabled");
+    return;
+#endif
+
     if (!protocol_) {
         return;
     }
@@ -1102,6 +1126,11 @@ bool Application::UpgradeFirmware(const std::string& url, const std::string& ver
 }
 
 void Application::WakeWordInvoke(const std::string& wake_word) {
+#if CONFIG_DISABLE_WAKE_WORD_TRIGGER
+    ESP_LOGI(TAG, "Wake word trigger is disabled: %s", wake_word.c_str());
+    return;
+#endif
+
     if (!protocol_) {
         return;
     }
