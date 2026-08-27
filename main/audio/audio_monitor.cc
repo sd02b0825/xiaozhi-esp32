@@ -8,8 +8,9 @@
 #include "system_info.h"
 
 #include <esp_log.h>
-#include <mbedtls/base64.h>
 #include <cJSON.h>
+
+#include <string>
 
 #define TAG "AudioMonitor"
 
@@ -271,6 +272,8 @@ void AudioMonitor::Feed(const std::vector<int16_t>& pcm_data) {
 void AudioMonitor::UploadTask() {
     ESP_LOGI(TAG, "Upload task started");
 
+    int consecutive_failures = 0;
+
     while (running_) {
         // Check every 100ms
         vTaskDelay(pdMS_TO_TICKS(100));
@@ -302,7 +305,25 @@ void AudioMonitor::UploadTask() {
         // Perform upload (this may take time but doesn't block audio feeding)
         // Check running_ before and after to enable early exit
         if (!running_) break;
-        UploadAudio(data_to_upload);
+        if (UploadAudio(data_to_upload)) {
+            consecutive_failures = 0;
+            continue;
+        }
+
+        consecutive_failures++;
+        ESP_LOGW(TAG, "Upload failed (%d/%d consecutive)",
+                 consecutive_failures, MAX_CONSECUTIVE_FAILURES);
+
+        if (consecutive_failures >= MAX_CONSECUTIVE_FAILURES) {
+            ESP_LOGW(TAG, "Pausing uploads for %d ms after %d consecutive failures",
+                     PAUSE_AFTER_FAILURES_MS, consecutive_failures);
+            // Drop buffered audio accumulated during the failing period so we
+            // resume with fresh samples instead of a backlog of stale PCM.
+            ring_buffer_->Clear();
+            PauseUploads(PAUSE_AFTER_FAILURES_MS);
+            consecutive_failures = 0;
+            ring_buffer_->Clear();
+        }
     }
 
     ESP_LOGI(TAG, "Upload task exiting gracefully");
@@ -316,9 +337,20 @@ void AudioMonitor::UploadTask() {
     vTaskDelete(NULL);
 }
 
-void AudioMonitor::UploadAudio(const std::vector<int16_t>& audio_data) {
+void AudioMonitor::PauseUploads(int duration_ms) {
+    // Sleep in short slices so Stop() can exit promptly without waiting
+    // the full cooldown.
+    constexpr int kSliceMs = 100;
+    int waited_ms = 0;
+    while (running_ && waited_ms < duration_ms) {
+        vTaskDelay(pdMS_TO_TICKS(kSliceMs));
+        waited_ms += kSliceMs;
+    }
+}
+
+bool AudioMonitor::UploadAudio(const std::vector<int16_t>& audio_data) {
     if (audio_data.empty()) {
-        return;
+        return false;
     }
 
     // Check network availability
@@ -326,7 +358,7 @@ void AudioMonitor::UploadAudio(const std::vector<int16_t>& audio_data) {
     if (network == nullptr) {
         ESP_LOGW(TAG, "Network not available, skip upload");
         upload_error_count_++;
-        return;
+        return false;
     }
 
     // Reuse the persistent HTTP client across uploads instead of creating and
@@ -339,31 +371,34 @@ void AudioMonitor::UploadAudio(const std::vector<int16_t>& audio_data) {
         if (http_ == nullptr) {
             ESP_LOGE(TAG, "Failed to create HTTP client");
             upload_error_count_++;
-            return;
+            return false;
         }
     }
 
-    // Convert PCM to base64
-    std::string base64_data = PcmToBase64(audio_data);
+    // Upload raw PCM as binary body. Metadata goes in headers so the body
+    // stays compact (no base64 +33% and no JSON wrapper).
+    const size_t pcm_bytes = audio_data.size() * sizeof(int16_t);
+    std::string body(reinterpret_cast<const char*>(audio_data.data()), pcm_bytes);
 
-    // Build JSON payload
-    std::string json_body = BuildJsonPayload(base64_data);
-
-    // Set HTTP headers
-    http_->SetHeader("Content-Type", "application/json");
+    http_->SetHeader("Content-Type", "application/octet-stream");
     http_->SetHeader("User-Agent", SystemInfo::GetUserAgent());
     http_->SetHeader("Device-Id", SystemInfo::GetMacAddress().c_str());
+    http_->SetHeader("Client-Id", client_id_.c_str());
+    http_->SetHeader("X-Sample-Rate", std::to_string(SAMPLE_RATE));
+    http_->SetHeader("X-Channels", "1");
+    http_->SetHeader("X-Bits", "16");
 
-    // Set request body
-    http_->SetContent(std::move(json_body));
+    http_->SetContent(std::move(body));
 
     // Send POST request
     if (!http_->Open("POST", upload_url_)) {
         ESP_LOGE(TAG, "HTTP request failed, error: 0x%x", http_->GetLastError());
         upload_error_count_++;
         // Connection not opened, no need to call Close()
-        return;
+        return false;
     }
+
+    bool success = false;
 
     // Check response status
     int status_code = http_->GetStatusCode();
@@ -373,12 +408,14 @@ void AudioMonitor::UploadAudio(const std::vector<int16_t>& audio_data) {
         // Parse response to check success flag
         cJSON* root = cJSON_Parse(response.c_str());
         if (root != nullptr) {
-            cJSON* success = cJSON_GetObjectItem(root, "success");
-            if (cJSON_IsBool(success) && cJSON_IsTrue(success)) {
+            cJSON* item = cJSON_GetObjectItem(root, "success");
+            if (cJSON_IsBool(item) && cJSON_IsTrue(item)) {
                 upload_count_++;
-                ESP_LOGI(TAG, "Upload success: %u samples (%.2f sec)",
+                success = true;
+                ESP_LOGI(TAG, "Upload success: %u samples (%.2f sec, %u bytes PCM)",
                          static_cast<unsigned int>(audio_data.size()),
-                         static_cast<float>(audio_data.size()) / SAMPLE_RATE);
+                         static_cast<float>(audio_data.size()) / SAMPLE_RATE,
+                         static_cast<unsigned int>(pcm_bytes));
             } else {
                 cJSON* message = cJSON_GetObjectItem(root, "message");
                 ESP_LOGW(TAG, "Upload rejected by server: %s",
@@ -401,54 +438,5 @@ void AudioMonitor::UploadAudio(const std::vector<int16_t>& audio_data) {
     // EspTcp::ReceiveTask; since the client is not destroyed here, the
     // OnTcpDisconnected callback remains safe.
     http_->Close();
-}
-
-std::string AudioMonitor::PcmToBase64(const std::vector<int16_t>& pcm) {
-    if (pcm.empty()) {
-        return "";
-    }
-
-    // Get raw PCM bytes
-    const uint8_t* raw_data = reinterpret_cast<const uint8_t*>(pcm.data());
-    size_t raw_len = pcm.size() * sizeof(int16_t);
-
-    // Calculate base64 output length
-    size_t base64_len = 0;
-    mbedtls_base64_encode(nullptr, 0, &base64_len, raw_data, raw_len);
-
-    // Encode to base64
-    std::string result(base64_len, '\0');
-    size_t actual_len = 0;
-    int ret = mbedtls_base64_encode(
-        reinterpret_cast<uint8_t*>(result.data()),
-        result.size(),
-        &actual_len,
-        raw_data,
-        raw_len);
-
-    if (ret != 0) {
-        ESP_LOGE(TAG, "Base64 encoding failed, error: %d", ret);
-        return "";
-    }
-
-    result.resize(actual_len);
-    return result;
-}
-
-std::string AudioMonitor::BuildJsonPayload(const std::string& base64_data) {
-    cJSON* root = cJSON_CreateObject();
-    if (root == nullptr) {
-        return "{}";
-    }
-
-    cJSON_AddStringToObject(root, "client_id", client_id_.c_str());
-    cJSON_AddStringToObject(root, "data", base64_data.c_str());
-
-    char* json_str = cJSON_PrintUnformatted(root);
-    std::string result(json_str);
-
-    cJSON_free(json_str);
-    cJSON_Delete(root);
-
-    return result;
+    return success;
 }

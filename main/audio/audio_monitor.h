@@ -3,7 +3,7 @@
  * @brief Audio monitoring service for idle state environment sound upload
  *
  * This module continuously captures audio in idle state and uploads
- * environment sound to a remote server via HTTP POST every 3 seconds.
+ * raw PCM environment sound to a remote server via HTTP POST.
  */
 #ifndef AUDIO_MONITOR_H
 #define AUDIO_MONITOR_H
@@ -96,7 +96,7 @@ private:
  *
  * This class runs independently from the main audio streaming pipeline.
  * It captures raw PCM audio from the microphone callback and periodically
- * uploads base64-encoded audio data to a remote server via HTTP.
+ * uploads raw PCM bytes to a remote server via HTTP POST.
  */
 class AudioMonitor {
 public:
@@ -148,22 +148,15 @@ private:
     /**
      * Perform HTTP upload of audio data
      * @param audio_data Raw PCM audio data to upload
+     * @return true if the server accepted the upload
      */
-    void UploadAudio(const std::vector<int16_t>& audio_data);
+    bool UploadAudio(const std::vector<int16_t>& audio_data);
 
     /**
-     * Convert PCM data to base64 string
-     * @param pcm Raw PCM data
-     * @return Base64 encoded string
+     * Interruptible pause used after consecutive upload failures.
+     * Returns early if Stop() clears running_.
      */
-    std::string PcmToBase64(const std::vector<int16_t>& pcm);
-
-    /**
-     * Construct JSON payload for HTTP request
-     * @param base64_data Base64 encoded audio data
-     * @return JSON string
-     */
-    std::string BuildJsonPayload(const std::string& base64_data);
+    void PauseUploads(int duration_ms);
 
     // Configuration constants
     static constexpr int SAMPLE_RATE = 16000;         // 16kHz sample rate
@@ -171,9 +164,11 @@ private:
         16000 * 5;  // 5 seconds ring buffer (fixed memory: ~160KB)
     static constexpr size_t UPLOAD_CHUNK_SAMPLES =
         16000 * 3;  // Upload chunk size: trigger when buffer >= 3s, read up to 3s per upload
-    static constexpr int UPLOAD_TASK_STACK_SIZE = 8192;  // Increased for HTTP + base64 operations
+    static constexpr int UPLOAD_TASK_STACK_SIZE = 8192;  // Stack for HTTP upload operations
     static constexpr int UPLOAD_TASK_PRIORITY = 5;
     static constexpr int HTTP_TIMEOUT_MS = 10000;  // 10 seconds HTTP timeout
+    static constexpr int MAX_CONSECUTIVE_FAILURES = 3;   // Pause after this many failures in a row
+    static constexpr int PAUSE_AFTER_FAILURES_MS = 60000;  // 1 minute cooldown
     // Grace period after closing the HTTP client before destroying it.
     // tcp_->Disconnect() is asynchronous: EspTcp::ReceiveTask may still fire
     // the OnTcpDisconnected callback shortly after Close() returns. Waiting a
